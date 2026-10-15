@@ -1,6 +1,6 @@
 'use strict';
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
-const { parseElements, refMsgIdx } = require('./events');
+const { parseElements, refMsgIdx, parseRecentContext } = require('./events');
 const DIR = __dirname;
 function loadConfig() {
   const c = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
@@ -19,7 +19,8 @@ function toPayload(t, d) {
     group_card: (d.author && d.author.card) || (d.member && d.member.card) || (d.member && d.member.nick) || null,
     content: (d.content || '').trim(), msg_id: d.id, timestamp: d.timestamp,
     attachments: d.attachments || [],
-    message_type: d.message_type ?? null, ref_msg_idx: refMsgIdx(d), quoted: parseElements(d).quoted };
+    message_type: d.message_type ?? null, ref_msg_idx: refMsgIdx(d), quoted: parseElements(d).quoted,
+    recent_context: (t === 'GROUP_AT_MESSAGE_CREATE' || t === 'GROUP_MESSAGE_CREATE') ? parseRecentContext(d) : [] };
   if (t === 'C2C_MESSAGE_CREATE') return { type: 'c2c', openid: d.author && d.author.user_openid, ...base };
   if (t === 'GROUP_AT_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: true, ...base };
   if (t === 'GROUP_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: false, ...base };
