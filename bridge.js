@@ -5,7 +5,7 @@ const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = requ
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
-const { getHistory, append } = require('./history');
+const { getHistory, append, mergeRecent } = require('./history');
 const { memoryPath } = require('./memory');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
@@ -26,7 +26,7 @@ function recordInbound(p, content) {
   try {
     p.history = getHistory(p.type, id);
     append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
-      openid: (p.author && (p.author.user_openid || p.author.member_openid)) || null,
+      openid: (p.author && (p.author.user_openid || p.author.member_openid)) || null, msg_id: p.msg_id,
       content: content ?? p.content, timestamp: p.timestamp || new Date().toISOString() });
   } catch (e) { log('history error', e.message); if (!Array.isArray(p.history)) p.history = []; }
 }
@@ -70,8 +70,13 @@ async function connect() {
               catch (e) { log('raw event dump error', e.message); }
             }
             const p = toPayload(m.t, m.d); if (!p) { log('unhandled event', m.t); break; }
+            // p.recent_context is set by toPayload (QQ's auto-attached group messages, message_type 103)
             if (seen.check(p.msg_id)) { log('dup', m.t, p.msg_id); break; }
-            try { await downloadImages(p); await downloadImages({ msg_id: p.msg_id + '-q', attachments: p.quoted.flatMap(q => q.attachments || []) }); } catch (e) { log('media error', e.message); }
+            try {
+              await downloadImages(p);
+              await downloadImages({ msg_id: p.msg_id + '-q', attachments: p.quoted.flatMap(q => q.attachments || []) });
+              await downloadImages({ msg_id: p.msg_id + '-rc', attachments: p.recent_context.flatMap(c => c.attachments || []) });
+            } catch (e) { log('media error', e.message); }
             const imgs = p.attachments.filter(a => a && a.local_path).map(a => a.local_path);
             const histContent = [p.content, ...imgs.map(x => '[图片] ' + x)].filter(Boolean).join('\n');
             if (p.type === 'group' && p.at === false) {
@@ -80,7 +85,13 @@ async function connect() {
               log('recv group-nonat', p.msg_id);
               break;
             }
-            if (p.type === 'group') p.recent_images = recent.get(p.group_openid);
+            if (p.type === 'group') {
+              p.recent_images = recent.get(p.group_openid);
+              if (p.recent_context.length) {
+                try { mergeRecent('group', p.group_openid, p.recent_context); }
+                catch (e) { log('history error', e.message); }
+              }
+            }
             log('recv', p.type, p.msg_id);
             recordInbound(p, histContent);
             forward(p);

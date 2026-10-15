@@ -1,7 +1,8 @@
 'use strict';
 
 const assert = require('node:assert');
-const { parseElements, refMsgIdx, SeenIds, RecentImages, redact } = require('../events.js');
+const { parseElements, parseRecentContext, refMsgIdx, SeenIds, RecentImages, redact } = require('../events.js');
+const { d, expectedContext, dWithMeta } = require('./recent_context_fixture.js');
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -73,6 +74,77 @@ test('parseElements author resolution', () => {
   assert.strictEqual(authorOf({ id: '2' }), '2');
   assert.strictEqual(authorOf({}), null);
   assert.strictEqual(authorOf(undefined), null);
+});
+
+// ---- recent-context (message_type 103 "=== 消息 N ===" blob) ----
+test('parseRecentContext invalid input -> []', () => {
+  for (const bad of [null, undefined, 42, 'x', {}, { msg_elements: 'x' }, { msg_elements: [] }]) {
+    assert.deepStrictEqual(parseRecentContext(bad), []);
+  }
+});
+
+test('parseRecentContext ignores events without the context marker', () => {
+  assert.deepStrictEqual(parseRecentContext({ msg_elements: [{ content: 'hi', message_type: 1 }] }), []);
+  // a 102/103 element that is NOT in the "=== 消息 ===" shape is not context
+  assert.deepStrictEqual(parseRecentContext({ msg_elements: [{ content: 'quote me', message_type: 103 }] }), []);
+});
+
+test('parseRecentContext parses the redacted real fixture', () => {
+  const r = parseRecentContext(d);
+  assert.strictEqual(r.length, 4);
+  assert.deepStrictEqual(r, expectedContext);
+  // indices run 1..4 in order; no author line in the sample -> every author null
+  assert.deepStrictEqual(r.map(e => e.index), [1, 2, 3, 4]);
+  assert.ok(r.every(e => e.author === null));
+  assert.ok(r.every(e => Array.isArray(e.attachments) && e.attachments.length === 0));
+});
+
+test('parseRecentContext parses author/nickname lines and [图片] urls', () => {
+  const r = parseRecentContext(dWithMeta);
+  assert.strictEqual(r.length, 2);
+  assert.deepStrictEqual(r[0], {
+    index: 1, author: '小明', content: '看看这个',
+    attachments: [{ content_type: 'image/*', url: 'http://127.0.0.1:9/a.png' }],
+  });
+  // "[昵称] x" is accepted as an author line too
+  assert.deepStrictEqual(r[1], { index: 2, author: '小红', content: '好的', attachments: [] });
+});
+
+test('parseRecentContext trims message content, keeps blank-free blocks', () => {
+  const r = parseRecentContext({ msg_elements: [{ message_type: 103, content: '=== 消息 1 ===\n[消息内容]   spaced  \n' }] });
+  assert.deepStrictEqual(r, [{ index: 1, author: null, content: 'spaced', attachments: [] }]);
+});
+
+test('parseRecentContext: element-level attachments attach to a single-message element', () => {
+  const att = { content_type: 'image/png', url: 'http://127.0.0.1:9/b.png' };
+  const r = parseRecentContext({ msg_elements: [{ message_type: 103, content: '=== 消息 1 ===\n[消息内容] hi', attachments: [att] }] });
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].attachments[0], att); // same reference, downloads like a quoted image
+});
+
+// ---- context elements are excluded from quoted/texts ----
+test('parseElements excludes context blobs from quoted/texts/attachments', () => {
+  const r = parseElements(d);
+  assert.deepStrictEqual(r, { texts: [], attachments: [], quoted: [] });
+});
+
+test('parseElements keeps only non-context elements in quoted', () => {
+  const r = parseElements(dWithMeta);
+  // the "=== 消息 ===" element is dropped; only the real @ text remains quoted
+  assert.deepStrictEqual(r.quoted, [{ author: null, content: '这是 @我 的消息', attachments: [] }]);
+  assert.deepStrictEqual(r.texts, ['这是 @我 的消息']);
+  // ...and its [图片] block never surfaced as a top-level attachment
+  assert.deepStrictEqual(r.attachments, []);
+});
+
+test('parseElements still quotes a real 102/103 next to a context blob', () => {
+  const att = { local_path: 'q1' };
+  const r = parseElements({ msg_elements: [
+    { message_type: 103, content: '=== 消息 1 ===\n[消息内容] ctx\n' }, // context -> skipped
+    { message_type: 102, content: 'real quote', author: { username: 'amy' }, attachments: [att] },
+  ] });
+  assert.deepStrictEqual(r.quoted, [{ author: 'amy', content: 'real quote', attachments: [att] }]);
+  assert.strictEqual(r.attachments[0], att);
 });
 
 // ---- refMsgIdx ----

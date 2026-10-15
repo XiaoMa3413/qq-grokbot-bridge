@@ -16,9 +16,12 @@ function parseLine(l) { try { const e = JSON.parse(l); return e && typeof e.cont
 function parseEntries(raw) { return String(raw || '').split('\n').filter(Boolean).map(parseLine).filter(Boolean); }
 function normalizeEntry(e) {
   const x = e || {};
-  return { role: x.role === 'bot' ? 'bot' : 'user', nickname: prim(x.nickname), member_role: prim(x.member_role),
+  const out = { role: x.role === 'bot' ? 'bot' : 'user', nickname: prim(x.nickname), member_role: prim(x.member_role),
     openid: prim(x.openid), content: String(x.content == null ? '' : x.content).slice(0, MAX_CONTENT),
     timestamp: x.timestamp == null || x.timestamp === '' ? new Date().toISOString() : String(x.timestamp) };
+  if (x.id != null && x.id !== '') out.id = prim(x.id); // optional; only present when the source carries one
+  if (x.msg_id != null && x.msg_id !== '') out.msg_id = prim(x.msg_id); // optional; only present when the source carries one
+  return out;
 }
 // Per-type entry limits, read from config.json (historyLimitC2c / historyLimitGroup), defaulting to 20 / 10.
 function positive(v, dflt) { const n = +v; return Number.isFinite(n) && n > 0 ? n : dflt; }
@@ -34,6 +37,11 @@ function getHistory(type, id) {
   try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')).slice(-historyLimit(type)); }
   catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
 }
+// Read every entry in the file (untouched by the per-type limit) for mergeRecent dedup.
+function readAll(type, id) {
+  try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')); }
+  catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
+}
 function append(type, id, entry) {
   try {
     const f = historyFile(type, id), e = normalizeEntry(entry);
@@ -46,4 +54,37 @@ function append(type, id, entry) {
     return e;
   } catch (e) { log('history append error', e.message); return null; }
 }
-module.exports = { getHistory, append, historyKey, historyFile, historyDir, normalizeEntry, historyLimit, trimAt, MAX_CONTENT };
+// Merge QQ's auto-attached recent-context items (parseRecentContext output) into
+// history as role:user entries, skipping duplicates. Each item
+// {author, content, attachments, timestamp?, msg_id?} becomes one entry; an
+// attachment carrying a local_path contributes a '[图片] <path>' content line,
+// exactly like a downloaded inbound image. A duplicate is any stored entry that
+// shares the same msg_id (when both carry one) OR the same trimmed content with
+// a compatible nickname (a null on either side matches) and a timestamp within
+// windowMs. Non-duplicates are appended in order; the newly-added count is
+// returned. History stays bounded by historyLimit through append().
+function mergeRecent(type, id, items, windowMs = 600000) {
+  if (!Array.isArray(items)) return 0;
+  let added = 0;
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+    const lines = [String(item.content == null ? '' : item.content)];
+    for (const a of attachments) if (a && a.local_path) lines.push('[图片] ' + a.local_path);
+    const entry = {
+      role: 'user', nickname: item.author || null, content: lines.join('\n'),
+      timestamp: item.timestamp || new Date().toISOString(), msg_id: item.msg_id || null };
+    const tMs = Date.parse(entry.timestamp);
+    const dup = readAll(type, id).some(e => {
+      const eMs = Date.parse(e.timestamp);
+      const within = Number.isFinite(tMs) && Number.isFinite(eMs) && Math.abs(tMs - eMs) <= windowMs;
+      const sameId = entry.msg_id != null && e.msg_id != null && String(entry.msg_id) === String(e.msg_id);
+      const sameText = String(e.content || '').trim() === entry.content.trim()
+        && (e.nickname == null || entry.nickname == null || e.nickname === entry.nickname) && within;
+      return sameId || sameText;
+    });
+    if (!dup && append(type, id, entry)) added++;
+  }
+  return added;
+}
+module.exports = { getHistory, append, mergeRecent, historyKey, historyFile, historyDir, normalizeEntry, historyLimit, trimAt, MAX_CONTENT };

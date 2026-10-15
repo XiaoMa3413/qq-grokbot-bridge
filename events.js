@@ -4,12 +4,79 @@ function str(v) {
   return typeof v === 'string' ? v : '';
 }
 
+// Recent-context ("=== 消息 N ===") markers. QQ auto-attaches the recent group
+// messages to a 103 element's content in this exact textual shape:
+//   === 消息 1 ===
+//   [消息内容] text
+//   [发送者] x        (optional author/nickname line)
+//   [图片] http://…   (optional image line)
+//   (blank line separates each message block)
+// There is no per-message msg id in the observed sample; message_scene.ext's
+// ref_msg_idx is a TMP_<uuid> context pointer, not a real quote.
+const CONTEXT_HEAD_RE = /^=== 消息 \d+ ===/;
+const CTX_HEADER_RE = /^=== 消息 (\d+) ===$/;
+const CTX_CONTENT_RE = /^\[消息内容\](.*)$/;
+const CTX_SENDER_RE = /^\[发送者\](.*)$/;
+const CTX_NICK_RE = /^\[昵称\](.*)$/;
+const CTX_IMAGE_RE = /^\[图片\](.*)$/;
+
+// Parse one context element's content into its message blocks.
+function parseContextElement(el) {
+  const entries = [];
+  let cur = null;
+  for (const rawLine of str(el.content).split('\n')) {
+    const line = rawLine.trim();
+    let m;
+    if ((m = CTX_HEADER_RE.exec(line))) {
+      if (cur) entries.push(cur);
+      cur = { index: parseInt(m[1], 10), author: null, content: '', attachments: [] };
+      continue;
+    }
+    if (!cur) continue; // lines before the first header are ignored
+    if ((m = CTX_CONTENT_RE.exec(line))) {
+      const text = m[1].trim();
+      cur.content = cur.content ? cur.content + '\n' + text : text;
+    } else if ((m = CTX_SENDER_RE.exec(line))) {
+      cur.author = m[1].trim() || null;
+    } else if ((m = CTX_NICK_RE.exec(line))) {
+      cur.author = m[1].trim() || null;
+    } else if ((m = CTX_IMAGE_RE.exec(line))) {
+      const url = m[1].trim();
+      if (url) cur.attachments.push({ content_type: 'image/*', url });
+    }
+  }
+  if (cur) entries.push(cur);
+  // Element-level attachments are a fallback for a single-message element whose
+  // image came through as a real attachment object rather than a "[图片]" line.
+  if (Array.isArray(el.attachments) && el.attachments.length && entries.length) {
+    for (const a of el.attachments) entries[entries.length - 1].attachments.push(a);
+  }
+  return entries;
+}
+
+// Walk d.msg_elements and return the recent-context blocks as
+// { index, author, content, attachments } entries. author is null unless a
+// "[发送者] x" / "[昵称] x" line is present; attachments combine "[图片] url"
+// lines and any element-level attachments (downloaded like quoted images later).
+function parseRecentContext(d) {
+  if (!d || typeof d !== 'object' || !Array.isArray(d.msg_elements)) return [];
+  const out = [];
+  for (const el of d.msg_elements) {
+    if (!el || typeof el !== 'object') continue;
+    if (!CONTEXT_HEAD_RE.test(str(el.content).trim())) continue;
+    out.push(...parseContextElement(el));
+  }
+  return out;
+}
+
 // Walk d.msg_elements recursively.
 // Returns { texts, attachments, quoted }.
 //   texts        - every non-empty trimmed content, at any depth.
 //   attachments  - every attachment object (same refs used inside quoted).
 //   quoted       - an entry for each top-level element AND each deeper element
 //                  whose message_type is 102 or 103.
+// Recent-context ("=== 消息 N ===") elements are skipped entirely: they are
+// QQ's auto-attached context, handled by parseRecentContext, never a real quote.
 function parseElements(d) {
   if (!d || typeof d !== 'object' || !Array.isArray(d.msg_elements)) {
     return { texts: [], attachments: [], quoted: [] };
@@ -23,6 +90,8 @@ function parseElements(d) {
       if (!el || typeof el !== 'object') continue;
 
       const content = str(el.content).trim();
+      if (CONTEXT_HEAD_RE.test(content)) continue; // recent-context blob, not a quote
+
       if (content !== '') texts.push(content);
 
       const atts = Array.isArray(el.attachments) ? el.attachments : [];
@@ -118,4 +187,4 @@ function redact(obj) {
   return obj;
 }
 
-module.exports = { parseElements, refMsgIdx, SeenIds, RecentImages, redact };
+module.exports = { parseElements, parseRecentContext, refMsgIdx, SeenIds, RecentImages, redact };

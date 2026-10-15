@@ -11,7 +11,7 @@ const { toPayload, TokenManager, QQApi } = require('../lib');
 const { parseElements, refMsgIdx } = require('../events');
 const { createReplyServer } = require('../reply_server');
 const { downloadImages } = require('../media');
-const { getHistory, append, historyKey, historyFile, historyLimit, trimAt } = require('../history');
+const { getHistory, append, historyKey, historyFile, historyLimit, trimAt, mergeRecent } = require('../history');
 const { memoryPath, memoryDir } = require('../memory');
 const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').trim().split('\n').filter(Boolean);
 (async () => {
@@ -134,6 +134,58 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(append('c2c', 'DIR', { role: 'user', content: 'x' }), null);
   assert.deepStrictEqual(getHistory('c2c', 'DIR'), []);
   assert.strictEqual(getHistory('c2c', 'U').length, 4);
+  // ---- recent_context: toPayload parses it for group events (empty for c2c); context is never a quote
+  {
+    const rcEl = { message_type: 103, content: '=== 消息 1 ===\n[消息内容] 你好\n\n=== 消息 2 ===\n[消息内容] 看来还没修好\n' };
+    const rc = toPayload('GROUP_AT_MESSAGE_CREATE', { id: 'rc-1', group_openid: 'RCG', content: '看看', timestamp: 'trc', message_type: 103, author: { member_openid: 'MM' }, msg_elements: [rcEl] });
+    assert.strictEqual(rc.type, 'group');
+    assert.strictEqual(rc.message_type, 103);
+    assert.strictEqual(rc.recent_context.length, 2);                    // two context blocks
+    assert.deepStrictEqual(rc.recent_context.map(e => e.content), ['你好', '看来还没修好']);
+    assert.ok(rc.recent_context.every(e => e.author === null));
+    assert.deepStrictEqual(rc.quoted, []);                             // the "=== 消息 ===" blob is never a real quote
+    // c2c and contextless group events carry an empty array
+    assert.deepStrictEqual(toPayload('C2C_MESSAGE_CREATE', { id: 'rc-2', author: { user_openid: 'U' } }).recent_context, []);
+    assert.deepStrictEqual(toPayload('GROUP_MESSAGE_CREATE', { id: 'rc-3', group_openid: 'RCG', author: { member_openid: 'MM' } }).recent_context, []);
+  }
+  // ---- mergeRecent: skips an entry already in history (same content, within window) and adds the other
+  {
+    const GID = 'MRC';
+    const ctx = toPayload('GROUP_AT_MESSAGE_CREATE', {
+      id: 'rc-m', group_openid: GID, content: 'x', message_type: 103, author: { member_openid: 'MM' },
+      msg_elements: [{ message_type: 103, content: '=== 消息 1 ===\n[消息内容] 你好\n\n=== 消息 2 ===\n[消息内容] 看来还没修好\n' }] }).recent_context;
+    // seed one matching block ("你好") with a fresh timestamp -> inside the default 10-minute window
+    append('group', GID, { role: 'user', nickname: null, content: '你好', timestamp: new Date().toISOString() });
+    assert.strictEqual(mergeRecent('group', GID, ctx), 1);             // only "看来还没修好" is new; the "你好" duplicate is skipped
+    assert.deepStrictEqual(getHistory('group', GID).map(e => e.content), ['你好', '看来还没修好']);
+    // idempotent: re-merging the same window adds nothing (both blocks are now present)
+    assert.strictEqual(mergeRecent('group', GID, ctx), 0);
+    assert.deepStrictEqual(getHistory('group', GID).map(e => e.content), ['你好', '看来还没修好']);
+  }
+  // ---- mergeRecent: windowMs gates the content match — an old copy is NOT treated as a duplicate
+  {
+    const GID = 'MRC_WIN';
+    append('group', GID, { role: 'user', nickname: null, content: 'hello', timestamp: new Date(Date.now() - 3600000).toISOString() });
+    assert.strictEqual(mergeRecent('group', GID, [{ index: 1, author: null, content: 'hello', attachments: [] }], 600000), 1);
+    assert.deepStrictEqual(getHistory('group', GID).map(e => e.content), ['hello', 'hello']);
+  }
+  // ---- mergeRecent: dedup by msg_id when both carry one (content/author differ); normalizeEntry keeps msg_id
+  {
+    const GID = 'MRC_ID';
+    const now = new Date().toISOString();
+    append('group', GID, { role: 'user', nickname: 'zed', msg_id: 'ID_1', content: 'first', timestamp: now });
+    assert.strictEqual(mergeRecent('group', GID, [{ author: 'other', content: 'different', msg_id: 'ID_1' }]), 0); // same msg_id -> skipped
+    assert.strictEqual(mergeRecent('group', GID, [{ author: 'other', content: 'different', msg_id: 'ID_2' }]), 1); // new msg_id -> appended
+    assert.deepStrictEqual(getHistory('group', GID).map(e => [e.content, e.msg_id]), [['first', 'ID_1'], ['different', 'ID_2']]);
+  }
+  // ---- mergeRecent: images become '[图片] <path>' lines; a null author matches a real author within window
+  {
+    const GID = 'MRC_IMG';
+    append('group', GID, { role: 'user', nickname: 'alice', content: 'look\n[图片] ' + path.join(MDIA, 'p.bin'), timestamp: new Date().toISOString() });
+    // entry content is identical (image line included) + null author matches alice + within window -> skipped
+    assert.strictEqual(mergeRecent('group', GID, [{ author: null, content: 'look', attachments: [{ local_path: path.join(MDIA, 'p.bin') }] }]), 0);
+    assert.deepStrictEqual(getHistory('group', GID).map(e => [e.nickname, e.content]), [['alice', 'look\n[图片] ' + path.join(MDIA, 'p.bin')]]);
+  }
   // ---- memory: one markdown file per conversation, created empty on demand
   assert.strictEqual(memoryDir(), MDIR);
   assert.strictEqual(memoryPath('c2c', 'U'), path.join(MDIR, 'c2c-U.md'));
