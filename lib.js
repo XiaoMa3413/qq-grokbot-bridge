@@ -1,5 +1,5 @@
 'use strict';
-const fs = require('fs'), path = require('path'), crypto = require('crypto');
+const fs = require('fs'), path = require('path'), crypto = require('crypto'), util = require('util');
 const { parseElements, refMsgIdx, parseRecentContext } = require('./events');
 const DIR = __dirname;
 function loadConfig() {
@@ -10,7 +10,20 @@ function loadConfig() {
   if (process.env.QQ_REPLY_PORT) c.replyPort = +process.env.QQ_REPLY_PORT;
   return c;
 }
-function log(...a) { console.log(new Date().toISOString(), ...a); }
+// Network timeout for every outbound fetch (token, QQ API, forward webhook).
+const HTTP_TIMEOUT_MS = Number(process.env.QQ_HTTP_TIMEOUT_MS) || 15000;
+// fetch() that reports its abort as an ETIMEDOUT error so callers/retries treat it as a timeout.
+async function fetchTimeout(url, init) {
+  try { return await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }); }
+  catch (e) {
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+      const t = new Error(`timeout after ${HTTP_TIMEOUT_MS}ms: ${url}`); t.code = 'ETIMEDOUT'; throw t;
+    }
+    throw e;
+  }
+}
+// Synchronous stdout write, so log lines never interleave or get dropped on abrupt exit.
+function log(...a) { fs.writeSync(1, new Date().toISOString() + ' ' + util.format(...a) + '\n'); }
 // Convert a QQ dispatch event to the forward payload
 function toPayload(t, d) {
   const base = {
@@ -39,7 +52,7 @@ class TokenManager {
     return this.p;
   }
   async _fetch() {
-    const r = await fetch(this.cfg.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const r = await fetchTimeout(this.cfg.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ appId: this.appId, clientSecret: this.secret }) });
     const j = await r.json();
     if (!j.access_token) throw new Error('getAppAccessToken failed: ' + JSON.stringify({ code: j.code, message: j.message }));
@@ -51,7 +64,7 @@ class TokenManager {
 class QQApi {
   constructor(cfg, tm) { this.cfg = cfg; this.tm = tm; this.seq = new Map(); }
   async req(method, p, body) {
-    const r = await fetch(this.cfg.apiBase + p, { method, headers: {
+    const r = await fetchTimeout(this.cfg.apiBase + p, { method, headers: {
       Authorization: 'QQBot ' + await this.tm.get(), 'Content-Type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined });
     const text = await r.text(); let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
@@ -83,4 +96,4 @@ class QQApi {
     return this.req('POST', p, body);
   }
 }
-module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR };
+module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR, HTTP_TIMEOUT_MS };

@@ -1,12 +1,13 @@
 'use strict';
 const WebSocket = require('ws');
 const fs = require('fs'), path = require('path');
-const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = require('./lib');
+const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, HTTP_TIMEOUT_MS } = require('./lib');
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
 const { getHistory, append, mergeRecent } = require('./history');
 const { memoryPath } = require('./memory');
+const { Watchdog } = require('./watchdog');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
 const cfg = loadConfig();
@@ -18,6 +19,10 @@ setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30
 
 // Dispatch-level dedup (last 1000 message ids) and per-group recent images (last 10 min, 5 per group).
 const seen = new SeenIds(1000), recent = new RecentImages(600000, 5);
+
+// If a fresh connection never completes its handshake (no READY/RESUMED), give up and exit
+// so the supervisor restarts us, rather than hanging forever half-connected.
+const readyWd = new Watchdog({ onFire: reason => { log('WATCHDOG', reason, 'exit 1'); process.exit(1); } });
 
 // Attach the conversation history and the long-term memory path to a forwarded payload (before the current message is recorded), then record the current one.
 function recordInbound(p, content) {
@@ -35,35 +40,39 @@ async function forward(p) {
   const h = { 'Content-Type': 'application/json' };
   if (process.env.QQ_FORWARD_WEBHOOK_SECRET) { const hn = process.env.QQ_FORWARD_WEBHOOK_HEADER || 'Authorization'; h[hn] = hn.toLowerCase() === 'authorization' ? 'Bearer ' + process.env.QQ_FORWARD_WEBHOOK_SECRET : process.env.QQ_FORWARD_WEBHOOK_SECRET; }
   for (let i = 0; i < 3; i++) {
-    try { const r = await fetch(cfg.forwardWebhookUrl, { method: 'POST', headers: h, body: JSON.stringify(p) });
+    try { const r = await fetch(cfg.forwardWebhookUrl, { method: 'POST', headers: h, body: JSON.stringify(p), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
       if (r.ok) return log('forwarded', p.type, p.msg_id); log('forward HTTP', r.status); }
     catch (e) { log('forward error', e.message); }
     await new Promise(r => setTimeout(r, 1000 * 2 ** i));
   }
 }
 
-let sessionId = null, seq = null, hb = null, backoff = 1000;
+let sessionId = null, seq = null, hb = null, missed = 0, backoff = 1000;
 async function connect() {
   try {
+    readyWd.arm(Number(process.env.QQ_READY_TIMEOUT_MS) || 60000, 'no READY/RESUMED within timeout');
     const g = await api.req('GET', '/gateway');
-    const ws = new WebSocket(g.url); let acked = true;
+    const ws = new WebSocket(g.url, { handshakeTimeout: 15000 });
     ws.on('open', () => log('ws open'));
     ws.on('message', async raw => {
       const m = JSON.parse(raw); if (m.s) seq = m.s;
       switch (m.op) {
         case 10: {
-          clearInterval(hb);
-          hb = setInterval(() => { if (!acked) { log('heartbeat not acked, reconnect'); return ws.terminate(); } acked = false; ws.send(JSON.stringify({ op: 1, d: seq })); }, m.d.heartbeat_interval);
+          clearInterval(hb); missed = 0;
+          hb = setInterval(() => {
+            if (missed >= 2) { log('heartbeat not acked for 2 intervals, exit'); process.exit(1); }
+            missed++; ws.send(JSON.stringify({ op: 1, d: seq }));
+          }, m.d.heartbeat_interval);
           const token = 'QQBot ' + await tm.get();
           if (sessionId) ws.send(JSON.stringify({ op: 6, d: { token, session_id: sessionId, seq } }));
           else ws.send(JSON.stringify({ op: 2, d: { token, intents: cfg.intents, shard: [0, 1] } }));
           break; }
-        case 11: acked = true; break;
+        case 11: missed = 0; break;
         case 7: log('server requested reconnect'); ws.close(4000); break;
         case 9: log('invalid session, re-identify'); sessionId = null; seq = null; ws.close(4000); break;
         case 0:
-          if (m.t === 'READY') { sessionId = m.d.session_id; backoff = 1000; log('READY as', m.d.user && m.d.user.username); }
-          else if (m.t === 'RESUMED') { backoff = 1000; log('RESUMED'); }
+          if (m.t === 'READY') { sessionId = m.d.session_id; backoff = 1000; log('READY as', m.d.user && m.d.user.username); readyWd.disarm(); }
+          else if (m.t === 'RESUMED') { backoff = 1000; log('RESUMED'); readyWd.disarm(); }
           else {
             if (process.env.QQ_DEBUG_RAW_EVENTS === '1') {
               try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify(redact({ t: m.t, d: m.d })) + '\n'); }
@@ -98,7 +107,7 @@ async function connect() {
           }
       }
     });
-    ws.on('close', (c, r) => { clearInterval(hb); log('ws closed', c, String(r)); if ([4914, 4915].includes(c)) { log('bot offline/banned, exit'); process.exit(1); } if ([4004, 4006, 4007, 4009].includes(c) || c >= 4900) { sessionId = null; seq = null; } schedule(); });
+    ws.on('close', (c, r) => { clearInterval(hb); readyWd.disarm(); log('ws closed', c, String(r)); if ([4914, 4915].includes(c)) { log('bot offline/banned, exit'); process.exit(1); } if ([4004, 4006, 4007, 4009].includes(c) || c >= 4900) { sessionId = null; seq = null; } schedule(); });
     ws.on('error', e => log('ws error', e.message));
   } catch (e) { log('connect error', e.message, JSON.stringify(e.body || '')); schedule(); }
 }

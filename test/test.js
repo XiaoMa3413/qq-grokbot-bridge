@@ -8,6 +8,7 @@ process.env.QQ_MEMORY_DIR = MDIR;
 const MDIA = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-media-'));
 process.env.QQ_MEDIA_DIR = MDIA;
 const { toPayload, TokenManager, QQApi } = require('../lib');
+const { Watchdog } = require('../watchdog');
 const { parseElements, refMsgIdx } = require('../events');
 const { createReplyServer } = require('../reply_server');
 const { downloadImages } = require('../media');
@@ -415,6 +416,78 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
     jr = await (await post({ type: 'c2c', openid: 'IU', msg_id: 'i4', content: 'plain' })).json();
     assert.strictEqual(jr.images_sent, undefined);
     fs.rmSync(IDIR, { recursive: true, force: true });
+  }
+  // ---- watchdog: fire / disarm / re-arm, driven by a fake timer (deterministic)
+  {
+    const armed = [];                                     // { id, ms, fn, cleared } queue
+    let autoFire = true;                                  // a new arm() fires only when we run it
+    const setTimer = (fn, ms) => { const t = { id: armed.length + 1, ms, fn, cleared: false }; armed.push(t); if (autoFire) t.fn(); return t.id; };
+    const clearTimer = id => { const t = armed.find(x => x.id === id); if (t) t.cleared = true; };
+    const runLast = () => armed[armed.length - 1].fn();    // manually fire the most recent arm
+    // fires with the reason after `ms`
+    let fired = null;
+    const w = new Watchdog({ onFire: r => { fired = r; }, setTimer, clearTimer });
+    w.arm(50, 'reason-A');
+    assert.deepStrictEqual(fired, 'reason-A');             // fake timer fired synchronously
+    assert.strictEqual(armed[armed.length - 1].ms, 50);    // armed for the requested ms
+    // re-arm replaces the prior timer: the old timer is cleared and only the newest can fire
+    autoFire = false; fired = null;
+    w.arm(60, 'reason-B'); w.arm(70, 'reason-C');
+    if (armed[armed.length - 2]) assert.strictEqual(armed[armed.length - 2].cleared, true); // reason-B cleared
+    runLast();
+    assert.deepStrictEqual(fired, 'reason-C');             // only the newest timer fires, with its own reason
+    // disarm cancels a pending timer so onFire never runs
+    fired = null;
+    w.arm(80, 'reason-D');
+    assert.strictEqual(armed[armed.length - 1].cleared, false); // still pending
+    w.disarm();
+    assert.strictEqual(armed[armed.length - 1].cleared, true);  // cancelled
+    runLast();                                            // firing a disarmed entry is a no-op in real life; onFire stays null
+    assert.strictEqual(fired, null);
+    // lazily-armed watchdog, fired on demand
+    autoFire = false; fired = null;
+    const lz = new Watchdog({ onFire: r => { fired = r; }, setTimer, clearTimer });
+    lz.arm(90, 'reason-E');
+    assert.strictEqual(fired, null);                      // armed but not yet fired
+    armed[armed.length - 1].fn();
+    assert.deepStrictEqual(fired, 'reason-E');
+    // disarming an unarmed or already-fired watchdog is a safe no-op
+    w.disarm(); lz.disarm();
+  }
+  // ---- watchdog: real-time fire / disarm using tiny sleeps
+  {
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    let fired = null;
+    const w = new Watchdog({ onFire: r => { fired = r; } });
+    w.arm(15, 'boom'); await sleep(60);
+    assert.strictEqual(fired, 'boom');                    // real setTimeout fired
+    fired = null;
+    w.arm(40, 'wait'); w.disarm(); await sleep(90);
+    assert.strictEqual(fired, null);                      // disarmed before it could fire
+  }
+  // ---- lib.js fetch timeout: a server that never responds is aborted into an ETIMEDOUT error
+  {
+    const hangServer = http.createServer(() => {});            // accepts the connection, never replies
+    const sockets = new Set(); hangServer.on('connection', s => sockets.add(s));
+    await new Promise(r => hangServer.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${hangServer.address().port}`;
+    // HTTP_TIMEOUT_MS in lib.js is captured at require time, so a small override needs a FRESH
+    // require: swap in a re-required copy with the env var set, drive the real token fetch through
+    // fetchTimeout (AbortSignal.timeout -> ETIMEDOUT), then restore the original module.
+    const libPath = require.resolve('../lib');
+    const prevLib = require.cache[libPath];
+    process.env.QQ_HTTP_TIMEOUT_MS = '120';
+    delete require.cache[libPath];
+    const freshLib = require('../lib');                        // re-reads QQ_HTTP_TIMEOUT_MS = 120
+    let err = null;
+    try { await new freshLib.TokenManager({ tokenUrl: base + '/token' }, 'a', 's').get(); }
+    catch (e) { err = e; }
+    assert.ok(err, 'expected the hanging token fetch to reject');
+    assert.strictEqual(err.code, 'ETIMEDOUT');
+    delete process.env.QQ_HTTP_TIMEOUT_MS;
+    require.cache[libPath] = prevLib;                          // restore the original (HTTP_TIMEOUT_MS = 15000)
+    for (const s of sockets) s.destroy();
+    await new Promise(r => hangServer.close(r));
   }
   console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true }); fs.rmSync(MDIR, { recursive: true, force: true }); fs.rmSync(MDIA, { recursive: true, force: true });
 })().catch(e => { console.error(e); process.exit(1); });
