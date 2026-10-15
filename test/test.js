@@ -1,4 +1,5 @@
 'use strict';
+require('./events.test.js');
 const assert = require('assert'), http = require('http'), fs = require('fs'), os = require('os'), path = require('path');
 const HDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-history-'));
 process.env.QQ_HISTORY_DIR = HDIR;
@@ -7,6 +8,7 @@ process.env.QQ_MEMORY_DIR = MDIR;
 const MDIA = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-media-'));
 process.env.QQ_MEDIA_DIR = MDIA;
 const { toPayload, TokenManager, QQApi } = require('../lib');
+const { parseElements, refMsgIdx } = require('../events');
 const { createReplyServer } = require('../reply_server');
 const { downloadImages } = require('../media');
 const { getHistory, append, historyKey, historyFile, historyLimit, trimAt } = require('../history');
@@ -38,6 +40,39 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(g3.nickname, null);
   assert.strictEqual(g3.group_card, null);
   assert.strictEqual(toPayload('OTHER', {}), null);
+  // ---- toPayload: GROUP_MESSAGE_CREATE (group message not @-mentioning the bot) -> group shape with at:false
+  const nm = toPayload('GROUP_MESSAGE_CREATE', { id: 'm8', content: ' look ', group_openid: 'G', author: { member_openid: 'M' } });
+  assert.deepStrictEqual([nm.type, nm.group_openid, nm.at, nm.msg_id, nm.content], ['group', 'G', false, 'm8', 'look']);
+  assert.deepStrictEqual(nm.author, { member_openid: 'M' });
+  assert.strictEqual(nm.nickname, null);
+  assert.strictEqual(nm.group_card, null);
+  // ---- toPayload: GROUP_AT carries at:true, C2C has no at field
+  assert.strictEqual(g.at, true);
+  assert.ok(!('at' in c));
+  assert.ok(!('at' in c2));
+  // ---- toPayload: every payload exposes message_type / ref_msg_idx / quoted
+  const scene = { message_scene: { ext: ['msg_idx=XYZ', 'ref_msg_idx=RID'] } };
+  const elements = { msg_elements: [
+    { content: 'hi', message_type: 1 },
+    { content: 'quoted', message_type: 102, author: { username: 'amy' } } ] };
+  const expectedQuoted = [{ author: null, content: 'hi', attachments: [] }, { author: 'amy', content: 'quoted', attachments: [] }];
+  const cp = toPayload('C2C_MESSAGE_CREATE', { id: 'm9', content: 'hi', timestamp: 't', message_type: 7, ...scene, ...elements, author: { user_openid: 'U' } });
+  assert.strictEqual(cp.message_type, 7);
+  assert.strictEqual(cp.ref_msg_idx, 'RID');
+  assert.strictEqual(cp.ref_msg_idx, refMsgIdx({ ...scene, ...elements }));
+  assert.deepStrictEqual(cp.quoted, expectedQuoted);
+  assert.deepStrictEqual(cp.quoted, parseElements({ ...elements }).quoted);
+  // ---- toPayload: message_type/ref_msg_idx/quoted default when absent; same shape on the group types
+  const gp = toPayload('GROUP_AT_MESSAGE_CREATE', { id: 'm10', content: 'x', group_openid: 'G', ...scene, author: { member_openid: 'M' } });
+  assert.strictEqual(gp.message_type, null);
+  assert.strictEqual(gp.ref_msg_idx, 'RID');
+  assert.deepStrictEqual(gp.quoted, []);
+  const nmPlain = toPayload('GROUP_MESSAGE_CREATE', { id: 'm12', content: 'x', group_openid: 'G' });
+  assert.deepStrictEqual([nmPlain.at, nmPlain.message_type, nmPlain.ref_msg_idx], [false, null, null]);
+  assert.deepStrictEqual(nmPlain.quoted, []);
+  const plain = toPayload('C2C_MESSAGE_CREATE', { id: 'm11', content: 'x', timestamp: 't', author: { user_openid: 'U' } });
+  assert.deepStrictEqual([plain.message_type, plain.ref_msg_idx], [null, null]);
+  assert.deepStrictEqual(plain.quoted, []);
   // ---- history: keys, isolation, ordering
   assert.strictEqual(historyKey('c2c', 'U'), 'c2c-U');
   assert.strictEqual(historyKey('group', 'G'), 'group-G');

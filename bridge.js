@@ -4,6 +4,7 @@ const fs = require('fs'), path = require('path');
 const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = require('./lib');
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
+const { SeenIds, RecentImages, redact } = require('./events');
 const { getHistory, append } = require('./history');
 const { memoryPath } = require('./memory');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
@@ -15,15 +16,18 @@ const srv = createReplyServer(api, loadReplyToken());
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
 
+// Dispatch-level dedup (last 1000 message ids) and per-group recent images (last 10 min, 5 per group).
+const seen = new SeenIds(1000), recent = new RecentImages(600000, 5);
+
 // Attach the conversation history and the long-term memory path to a forwarded payload (before the current message is recorded), then record the current one.
-function recordInbound(p) {
+function recordInbound(p, content) {
   const id = p.type === 'group' ? p.group_openid : p.openid;
   p.memory_path = memoryPath(p.type, id);
   try {
     p.history = getHistory(p.type, id);
     append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
       openid: (p.author && (p.author.user_openid || p.author.member_openid)) || null,
-      content: p.content, timestamp: p.timestamp || new Date().toISOString() });
+      content: content ?? p.content, timestamp: p.timestamp || new Date().toISOString() });
   } catch (e) { log('history error', e.message); if (!Array.isArray(p.history)) p.history = []; }
 }
 async function forward(p) {
@@ -62,12 +66,25 @@ async function connect() {
           else if (m.t === 'RESUMED') { backoff = 1000; log('RESUMED'); }
           else {
             if (process.env.QQ_DEBUG_RAW_EVENTS === '1') {
-              try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify({ t: m.t, d: m.d }) + '\n'); }
+              try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify(redact({ t: m.t, d: m.d })) + '\n'); }
               catch (e) { log('raw event dump error', e.message); }
             }
-            const p = toPayload(m.t, m.d); if (p) { log('recv', p.type, p.msg_id); recordInbound(p);
-              try { await downloadImages(p); } catch (e) { log('media error', e.message); }
-              forward(p); } }
+            const p = toPayload(m.t, m.d); if (!p) { log('unhandled event', m.t); break; }
+            if (seen.check(p.msg_id)) { log('dup', m.t, p.msg_id); break; }
+            try { await downloadImages(p); await downloadImages({ msg_id: p.msg_id + '-q', attachments: p.quoted.flatMap(q => q.attachments || []) }); } catch (e) { log('media error', e.message); }
+            const imgs = p.attachments.filter(a => a && a.local_path).map(a => a.local_path);
+            const histContent = [p.content, ...imgs.map(x => '[图片] ' + x)].filter(Boolean).join('\n');
+            if (p.type === 'group' && p.at === false) {
+              for (const x of imgs) recent.add(p.group_openid, { local_path: x, nickname: p.nickname, timestamp: p.timestamp });
+              try { append('group', p.group_openid, { role: 'user', nickname: p.nickname, member_role: p.author.member_role, openid: p.author.member_openid || null, content: histContent, timestamp: p.timestamp || new Date().toISOString() }); } catch (e) { log('history error', e.message); }
+              log('recv group-nonat', p.msg_id);
+              break;
+            }
+            if (p.type === 'group') p.recent_images = recent.get(p.group_openid);
+            log('recv', p.type, p.msg_id);
+            recordInbound(p, histContent);
+            forward(p);
+          }
       }
     });
     ws.on('close', (c, r) => { clearInterval(hb); log('ws closed', c, String(r)); if ([4914, 4915].includes(c)) { log('bot offline/banned, exit'); process.exit(1); } if ([4004, 4006, 4007, 4009].includes(c) || c >= 4900) { sessionId = null; seq = null; } schedule(); });

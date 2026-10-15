@@ -7,7 +7,7 @@
 
 ```mermaid
 flowchart LR
-  QQ[QQ 用户 / 群] -->|私聊 / 群内 @| GW[QQ WebSocket 网关]
+  QQ[QQ 用户 / 群] -->|私聊 / 群消息| GW[QQ WebSocket 网关]
   GW --> B[bridge.js]
   B -->|POST JSON + Bearer| W[Grok Bot 智能体 webhook]
   W -.-> A[你的 Grok Bot 智能体]
@@ -19,7 +19,9 @@ flowchart LR
 ## 功能
 
 - **私聊（C2C）**：处理 `C2C_MESSAGE_CREATE` 事件。
-- **群聊只在被 @ 时响应**：只订阅 `GROUP_AT_MESSAGE_CREATE`，其他群消息根本不会推送过来。
+- **群聊被 @ 时响应**：处理 `GROUP_AT_MESSAGE_CREATE` 事件，载荷里的 `at` 为 `true`。
+- **群内非 @ 消息（`GROUP_MESSAGE_CREATE`）**：只记录、不打扰。需要在 QQ 群的机器人设置里开启「获取@机器人的最近10条消息」后才会推送；收到后先按 `msg_id` 去重（与被 @ 的消息共用同一张去重表），再下载图片附件、写入该群的对话历史，**不转发**给智能体、**不回复**。其中最近 10 分钟内的图片会进入一个群内缓存（最多 5 张，按时间升序），之后有人 @ 机器人时随 `recent_images` 一起转发。
+- **其他事件**：不认识的事件类型只在日志里记一行类型名，不解析、不转发。
 - **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带该类型会话最近的若干条记录（`history` 字段），不含当前这条；默认私聊最近 20 条、群聊最近 10 条。文件条数超过「上限 + 10」时裁剪回上限（私聊超过 30 条裁到 20 条，群聊超过 20 条裁到 10 条），每条内容最多保留 2000 字符。上限可在 `config.json` 中用 `historyLimitC2c` / `historyLimitGroup` 配置。机器人发出的回复也会写入历史。
 - **会话记忆文件**：每个会话有一个 Markdown 文件，不存在时自动创建为空文件，路径通过 `memory_path` 交给智能体。桥接本身不读也不写其中内容，由智能体自行维护。
 - **图片附件**：`image/*` 附件会下载到本地（单张上限 20 MB，超时 15 秒），成功后在附件上写入 `local_path`（绝对路径），失败则为 `null`。下载失败不影响消息转发。
@@ -46,7 +48,7 @@ flowchart LR
 | `QQ_REPLY_PORT` | 否 | 回复接口端口，默认 8787 |
 | `QQ_API_BASE` / `QQ_TOKEN_URL` | 否 | 覆盖 OpenAPI 地址和取 token 的地址 |
 | `QQ_HISTORY_DIR` / `QQ_MEMORY_DIR` / `QQ_MEDIA_DIR` | 否 | 覆盖数据目录 |
-| `QQ_DEBUG_RAW_EVENTS` | 否 | 设为 `1` 时，把原始事件追加写入 `logs/raw-events.jsonl` |
+| `QQ_DEBUG_RAW_EVENTS` | 否 | 设为 `1` 时，把原始事件追加写入 `logs/raw-events.jsonl`（已脱敏，见「调试」） |
 
 缺少 `QQ_APP_ID` 或 `QQ_APP_SECRET` 时，进程以退出码 78 退出，守护脚本收到后也会停止。
 
@@ -75,6 +77,7 @@ flowchart LR
 2. 启用单聊和群聊能力，确保有 `GROUP_AND_C2C_EVENT`（`1<<25`）事件权限。
 3. 本程序使用 WebSocket 网关，不需要配置公网回调地址。
 4. **沙箱阶段**：机器人上线前，只有加入沙箱配置的 QQ 号和群才能收到、发出消息。在群里 @ 了机器人却没有反应时，先检查这个群是否在沙箱群列表里，再检查成员是否在白名单里。
+5. **群内非 @ 消息**：在群的机器人设置里开启「获取@机器人的最近10条消息」，`GROUP_MESSAGE_CREATE` 才会推送过来。这类消息只记历史、不回复，同样受沙箱限制。
 
 ## 启动与停止
 
@@ -91,6 +94,14 @@ mkdir -p logs
 - 日志：`logs/bridge.log`、`logs/supervisor.log`。
 - 健康检查：`GET http://127.0.0.1:8787/health` → `{"ok":true}`
 
+### 调试
+
+```bash
+QQ_DEBUG_RAW_EVENTS=1 ./start.sh
+```
+
+设为 `1` 时，除 `READY` / `RESUMED` 之外的每个网关事件都会以 `{t, d}` 追加写入 `logs/raw-events.jsonl`，用来和 QQ 文档逐字段核对事件结构。写入前会做一次脱敏：任意层级的键名只要匹配 `token` 或 `secret`（不区分大小写），整个字段都会被丢掉。`logs/` 已在 `.gitignore` 中排除，这个文件只留在本地，不要提交。
+
 ## Webhook 转发格式
 
 ```json
@@ -101,15 +112,28 @@ mkdir -p logs
   "nickname": "<author.username>",
   "group_card": null,
   "content": "消息文本（已 trim）",
+  "quoted": [ { "author": "amy", "content": "被引用的内容", "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ] } ],
   "msg_id": "<QQ 消息 id>",
   "timestamp": "...",
   "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ],
+  "message_type": 0,
+  "ref_msg_idx": "<message_scene.ext 里的 ref_msg_idx>",
   "memory_path": "/abs/path/memory/c2c-<openid>.md",
   "history": [ { "role": "user|bot", "nickname": "...", "member_role": null, "openid": "...", "content": "...", "timestamp": "..." } ]
 }
 ```
 
-群消息的 `type` 为 `"group"`，用 `group_openid` 代替 `openid`。`author` 保留 QQ 事件里的原始字段。QQ v2 事件一般不提供群名片，所以 `group_card` 通常为 `null`。
+群消息的 `type` 为 `"group"`，用 `group_openid` 代替 `openid`，另外多两个字段：`at`（是否 @ 了机器人）和 `recent_images`（群里最近的非 @ 图片）。`author` 保留 QQ 事件里的原始字段。QQ v2 事件一般不提供群名片，所以 `group_card` 通常为 `null`。
+
+### 载荷字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `at` | bool | 群消息是否 @ 了机器人：`GROUP_AT_MESSAGE_CREATE` 为 `true`，`GROUP_MESSAGE_CREATE` 为 `false`；私聊载荷没有这个字段 |
+| `quoted` | array | 从 `msg_elements` 递归解析出来的引用/聊天记录，每项 `{ author, content, attachments }`；`message_type` 为 103（引用）或 102（聊天记录）的嵌套元素也会一并收进来 |
+| `message_type` | number \| null | 原始事件的 `message_type`，缺失时为 `null` |
+| `ref_msg_idx` | string \| null | 取自 `message_scene.ext` 里的 `ref_msg_idx=...`，没有则为 `null` |
+| `recent_images` | array | 该群最近 10 分钟内「非 @ 消息」里的图片，最多 5 张，按时间升序，每项 `{ local_path, nickname, timestamp }`；出现在被 @ 的群消息载荷上（没有缓存时为 `[]`），私聊载荷没有这个字段 |
 
 ## 回复接口
 
@@ -180,6 +204,8 @@ IMAGE=/abs/path/a.png ./reply.sh c2c <openid> <msg_id|-> [文字|-]   # 附带�
 ```bash
 node test/test.js
 ```
+
+一条命令跑两套测试：`test/test.js` 会先加载 `test/events.test.js`（事件解析、去重表、最近图片缓存、脱敏），再执行下面的主测试；任一断言失败都会以非 0 退出码结束。
 
 测试使用临时目录和本地模拟服务器，覆盖事件转换、token 刷新、回复接口（鉴权、拆分、被动回复上限、截断）、历史记录、记忆路径和图片下载，不需要真实的 QQ 凭据。
 
