@@ -14,12 +14,16 @@ function log(...a) { console.log(new Date().toISOString(), ...a); }
 function toPayload(t, d) {
   if (t === 'C2C_MESSAGE_CREATE') return {
     type: 'c2c', openid: d.author && d.author.user_openid,
-    author: { user_openid: d.author && d.author.user_openid },
+    author: d.author ? { ...d.author } : {},
+    nickname: (d.author && d.author.username) || null,
+    group_card: (d.author && d.author.card) || (d.member && d.member.card) || (d.member && d.member.nick) || null,
     content: (d.content || '').trim(), msg_id: d.id, timestamp: d.timestamp,
     attachments: d.attachments || [] };
   if (t === 'GROUP_AT_MESSAGE_CREATE') return {
     type: 'group', group_openid: d.group_openid,
-    author: { member_openid: d.author && d.author.member_openid },
+    author: d.author ? { ...d.author } : {},
+    nickname: (d.author && d.author.username) || null,
+    group_card: (d.author && d.author.card) || (d.member && d.member.card) || (d.member && d.member.nick) || null,
     content: (d.content || '').trim(), msg_id: d.id, timestamp: d.timestamp,
     attachments: d.attachments || [] };
   return null;

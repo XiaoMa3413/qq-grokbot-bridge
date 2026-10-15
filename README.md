@@ -12,6 +12,7 @@ Stays running on the box. Connects to the official QQ bot WebSocket gateway, rec
 | QQ_FORWARD_WEBHOOK_HEADER | no | Header name, default `Authorization: Bearer <secret>` |
 | QQ_REPLY_PORT | no | Reply port, default 8787 |
 | QQ_API_BASE / QQ_TOKEN_URL | no | Testing only: overrides the QQ API endpoints |
+| QQ_DEBUG_RAW_EVENTS | no | 设为 `1` 时把原始事件写入 `logs/raw-events.jsonl`（默认关闭；文件可能含 auth_token，勿提交） |
 
 If QQ_APP_ID or QQ_APP_SECRET is missing, the bridge exits with code 78 and the supervisor stops too.
 
@@ -27,10 +28,32 @@ Logs: `logs/bridge.log`, `logs/supervisor.log`. The box has no systemd, so a bas
 `POST $QQ_FORWARD_WEBHOOK_URL`, Content-Type: application/json, with header `Authorization: Bearer <secret>: <secret>`. A failed POST is retried up to 3 times.
 ```json
 {"type":"c2c","openid":"USER_OPENID","author":{"user_openid":"USER_OPENID"},
+ "nickname":"昵称或null","group_card":null,
  "content":"你好","msg_id":"ROBOT1.0_xxx","timestamp":"2026-10-14T11:00:00+08:00","attachments":[]}
-{"type":"group","group_openid":"GROUP_OPENID","author":{"member_openid":"MEMBER_OPENID"},
+{"type":"group","group_openid":"GROUP_OPENID","author":{"id":"...","username":"...","bot":false,"member_openid":"MEMBER_OPENID","member_role":"member"},
+ "nickname":"昵称或null","group_card":null,
  "content":"你好","msg_id":"ROBOT1.0_yyy","timestamp":"...","attachments":[]}
 ```
+
+### 发送者字段
+- `author`: 原始 QQ author 对象，原样透传，未做任何删改。
+- `nickname`: 取自 `author.username`；为空时（例如用户没有设置昵称）为 `null`。实际使用中 username 可能为空字符串。
+- `group_card`: 恒为 `null`。QQ 官方机器人 API v2 的事件和群成员接口都没有群名片（card）字段，只有昵称；群成员接口 `GET /v2/groups/{group_openid}/members/{member_openid}` 虽然返回 username，但仅白名单可用（错误码 11253），bridge 未调用。
+
+按官方文档 [group_at_message_create](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_at_message_create.html)，author (User) 的字段如下：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 用户 ID |
+| `username` | 昵称，实际可能为空 |
+| `bot` | 是否为机器人 |
+| `union_openid` | 可能为空，需申请绑定 |
+| `union_user_account` | 可能为空 |
+| `user_openid` | 单聊场景的用户 openid |
+| `member_openid` | 群聊场景的成员 openid |
+| `member_role` | 群内角色：`member` / `admin` / `owner`（仅群聊） |
+
+调试: 设置环境变量 `QQ_DEBUG_RAW_EVENTS=1` 时，bridge 会把原始事件（未转换的 `{t, d}`）追加写入 `logs/raw-events.jsonl`，默认关闭。该文件可能包含 message_scene 中的 auth_token，属于敏感数据，不要提交到 git。
 
 ## Reply API (QQ 小企鹅 -> bridge)
 `POST http://127.0.0.1:8787/reply`, header `X-Reply-Token: <contents of reply_token>` (a local token the bridge generates automatically; it is not a QQ credential).

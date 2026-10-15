@@ -1,5 +1,6 @@
 'use strict';
 const WebSocket = require('ws');
+const fs = require('fs'), path = require('path');
 const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = require('./lib');
 const { createReplyServer } = require('./reply_server');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
@@ -45,7 +46,12 @@ async function connect() {
         case 0:
           if (m.t === 'READY') { sessionId = m.d.session_id; backoff = 1000; log('READY as', m.d.user && m.d.user.username); }
           else if (m.t === 'RESUMED') { backoff = 1000; log('RESUMED'); }
-          else { const p = toPayload(m.t, m.d); if (p) { log('recv', p.type, p.msg_id); forward(p); } }
+          else {
+            if (process.env.QQ_DEBUG_RAW_EVENTS === '1') {
+              try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify({ t: m.t, d: m.d }) + '\n'); }
+              catch (e) { log('raw event dump error', e.message); }
+            }
+            const p = toPayload(m.t, m.d); if (p) { log('recv', p.type, p.msg_id); forward(p); } }
       }
     });
     ws.on('close', (c, r) => { clearInterval(hb); log('ws closed', c, String(r)); if ([4914, 4915].includes(c)) { log('bot offline/banned, exit'); process.exit(1); } if ([4004, 4006, 4007, 4009].includes(c) || c >= 4900) { sessionId = null; seq = null; } schedule(); });
