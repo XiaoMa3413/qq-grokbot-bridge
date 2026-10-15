@@ -1,0 +1,8 @@
+{
+  "forwardWebhookUrl": "",
+  "replyHost": "127.0.0.1",
+  "replyPort": 8787,
+  "apiBase": "https://api.sgroup.qq.com",
+  "tokenUrl": "https://bots.qq.com/app/getAppAccessToken",
+  "intents": 33554432
+}

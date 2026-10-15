@@ -1,0 +1,69 @@
+'use strict';
+const fs = require('fs'), path = require('path'), crypto = require('crypto');
+const DIR = __dirname;
+function loadConfig() {
+  const c = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
+  c.forwardWebhookUrl = process.env.QQ_FORWARD_WEBHOOK_URL || c.forwardWebhookUrl;
+  if (process.env.QQ_API_BASE) c.apiBase = process.env.QQ_API_BASE;
+  if (process.env.QQ_TOKEN_URL) c.tokenUrl = process.env.QQ_TOKEN_URL;
+  if (process.env.QQ_REPLY_PORT) c.replyPort = +process.env.QQ_REPLY_PORT;
+  return c;
+}
+function log(...a) { console.log(new Date().toISOString(), ...a); }
+// Convert a QQ dispatch event to the forward payload
+function toPayload(t, d) {
+  if (t === 'C2C_MESSAGE_CREATE') return {
+    type: 'c2c', openid: d.author && d.author.user_openid,
+    author: { user_openid: d.author && d.author.user_openid },
+    content: (d.content || '').trim(), msg_id: d.id, timestamp: d.timestamp,
+    attachments: d.attachments || [] };
+  if (t === 'GROUP_AT_MESSAGE_CREATE') return {
+    type: 'group', group_openid: d.group_openid,
+    author: { member_openid: d.author && d.author.member_openid },
+    content: (d.content || '').trim(), msg_id: d.id, timestamp: d.timestamp,
+    attachments: d.attachments || [] };
+  return null;
+}
+function loadReplyToken() {
+  const f = path.join(DIR, 'reply_token');
+  if (!fs.existsSync(f)) fs.writeFileSync(f, crypto.randomBytes(24).toString('hex') + '\n', { mode: 0o600 });
+  return fs.readFileSync(f, 'utf8').trim();
+}
+class TokenManager {
+  constructor(cfg, appId, secret) { this.cfg = cfg; this.appId = appId; this.secret = secret; this.token = null; this.exp = 0; this.p = null; }
+  async get() {
+    if (this.token && Date.now() < this.exp - 60000) return this.token;
+    if (!this.p) this.p = this._fetch().finally(() => { this.p = null; });
+    return this.p;
+  }
+  async _fetch() {
+    const r = await fetch(this.cfg.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appId: this.appId, clientSecret: this.secret }) });
+    const j = await r.json();
+    if (!j.access_token) throw new Error('getAppAccessToken failed: ' + JSON.stringify({ code: j.code, message: j.message }));
+    this.token = j.access_token; this.exp = Date.now() + Number(j.expires_in || 7200) * 1000;
+    log('access token refreshed, expires_in', j.expires_in);
+    return this.token;
+  }
+}
+class QQApi {
+  constructor(cfg, tm) { this.cfg = cfg; this.tm = tm; this.seq = new Map(); }
+  async req(method, p, body) {
+    const r = await fetch(this.cfg.apiBase + p, { method, headers: {
+      Authorization: 'QQBot ' + await this.tm.get(), 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined });
+    const text = await r.text(); let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
+    if (!r.ok) { const e = new Error(`QQ API ${r.status}`); e.status = r.status; e.body = j; throw e; }
+    return j;
+  }
+  nextSeq(msgId) { const n = (this.seq.get(msgId) || 0) + 1; this.seq.set(msgId, n);
+    if (this.seq.size > 5000) this.seq.delete(this.seq.keys().next().value); return n; }
+  send(type, target, content, msgId) {
+    const p = type === 'c2c' ? `/v2/users/${encodeURIComponent(target)}/messages`
+                             : `/v2/groups/${encodeURIComponent(target)}/messages`;
+    const body = { content, msg_type: 0 };
+    if (msgId) { body.msg_id = msgId; body.msg_seq = this.nextSeq(msgId); }
+    return this.req('POST', p, body);
+  }
+}
+module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR };
