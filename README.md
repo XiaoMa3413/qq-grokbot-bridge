@@ -20,7 +20,6 @@ flowchart LR
 
 - **私聊（C2C）**：处理 `C2C_MESSAGE_CREATE` 事件。
 - **群聊被 @ 时响应**：处理 `GROUP_AT_MESSAGE_CREATE` 事件，载荷里的 `at` 为 `true`。
-- **被 @ 时的最近群消息上下文**：群的机器人设置开启了「获取@机器人的最近10条消息」后，有人 @ 机器人（`GROUP_AT_MESSAGE_CREATE`，`message_type` 103）时，QQ 会把最近的若干条群消息自动附带进这条 @ 事件，放进某个 `msg_elements[].content`，格式是 `=== 消息 N ===` 跟随 `[消息内容] …` 的分块文本。这些自动附带的上下文不再当作引用：它们被解析进新的载荷字段 `recent_context`（每项 `{ index, author, content, attachments }`；观测样本里没有每条的作者/id，`author` 通常为 `null`），其中的图片附件会照常下载，成功写 `local_path`、失败为 `null`。它们会以 `role: user` 并入该群的对话历史，并按「`msg_id` 相同，或去空格后内容相同且作者兼容（`null` 视为通配）且时间相差不超过 10 分钟」判重；群对话历史上限仍为 10 条。被 @ 消息的 `quoted` 不再包含这些上下文块，只保留不匹配该格式的 `msg_elements`。
 - **群内非 @ 消息（`GROUP_MESSAGE_CREATE`）**：只记录、不打扰。需要在 QQ 群的机器人设置里开启「获取@机器人的最近10条消息」后才会推送；收到后先按 `msg_id` 去重（与被 @ 的消息共用同一张去重表），再下载图片附件、写入该群的对话历史，**不转发**给智能体、**不回复**。其中最近 10 分钟内的图片会进入一个群内缓存（最多 5 张，按时间升序），之后有人 @ 机器人时随 `recent_images` 一起转发。
 - **其他事件**：不认识的事件类型只在日志里记一行类型名，不解析、不转发。
 - **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带该类型会话最近的若干条记录（`history` 字段），不含当前这条；默认私聊最近 20 条、群聊最近 10 条。文件条数超过「上限 + 10」时裁剪回上限（私聊超过 30 条裁到 20 条，群聊超过 20 条裁到 10 条），每条内容最多保留 2000 字符。上限可在 `config.json` 中用 `historyLimitC2c` / `historyLimitGroup` 配置。机器人发出的回复也会写入历史。
@@ -114,7 +113,6 @@ QQ_DEBUG_RAW_EVENTS=1 ./start.sh
   "group_card": null,
   "content": "消息文本（已 trim）",
   "quoted": [ { "author": "amy", "content": "被引用的内容", "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ] } ],
-  "recent_context": [],
   "msg_id": "<QQ 消息 id>",
   "timestamp": "...",
   "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ],
@@ -125,43 +123,16 @@ QQ_DEBUG_RAW_EVENTS=1 ./start.sh
 }
 ```
 
-群消息的 `type` 为 `"group"`，用 `group_openid` 代替 `openid`，另外多几个字段：`at`（是否 @ 了机器人）、`recent_images`（群里最近的非 @ 图片）和 `recent_context`（QQ 自动附带的最近群消息上下文，其他事件上为 `[]`）。`author` 保留 QQ 事件里的原始字段。QQ v2 事件一般不提供群名片，所以 `group_card` 通常为 `null`。被 @ 且群设置开启了「获取@机器人的最近10条消息」的群消息会带上非空的 `recent_context`，下面是示例：
-
-```json
-{
-  "type": "group",
-  "group_openid": "<group_openid>",
-  "at": true,
-  "author": { "id": "...", "username": "...", "member_openid": "...", "member_role": "...", "union_openid": "..." },
-  "nickname": "<author.username>",
-  "group_card": null,
-  "content": "这条 @ 机器人消息自己的文本（已 trim）",
-  "quoted": [ ],
-  "recent_context": [
-    { "index": 1, "author": null, "content": "上下文中第 1 条的内容", "attachments": [] },
-    { "index": 2, "author": null, "content": "上下文中第 2 条的内容",
-      "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ] }
-  ],
-  "recent_images": [ ],
-  "msg_id": "<QQ 消息 id>",
-  "timestamp": "...",
-  "attachments": [ ],
-  "message_type": 103,
-  "ref_msg_idx": "TMP_...",
-  "memory_path": "/abs/path/memory/group-<group_openid>.md",
-  "history": [ { "role": "user|bot", "nickname": "...", "member_role": null, "openid": "...", "content": "...", "timestamp": "..." } ]
-}
-```
+群消息的 `type` 为 `"group"`，用 `group_openid` 代替 `openid`，另外多两个字段：`at`（是否 @ 了机器人）和 `recent_images`（群里最近的非 @ 图片）。`author` 保留 QQ 事件里的原始字段。QQ v2 事件一般不提供群名片，所以 `group_card` 通常为 `null`。
 
 ### 载荷字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `at` | bool | 群消息是否 @ 了机器人：`GROUP_AT_MESSAGE_CREATE` 为 `true`，`GROUP_MESSAGE_CREATE` 为 `false`；私聊载荷没有这个字段 |
-| `quoted` | array | 从 `msg_elements` 递归解析出来的引用/聊天记录，每项 `{ author, content, attachments }`；`message_type` 为 103（引用）或 102（聊天记录）的嵌套元素也会一并收进来；匹配「=== 消息 N ===」格式的最近群消息上下文块不算引用，改放 `recent_context`，不出现在这里 |
+| `quoted` | array | 从 `msg_elements` 递归解析出来的引用/聊天记录，每项 `{ author, content, attachments }`；`message_type` 为 103（引用）或 102（聊天记录）的嵌套元素也会一并收进来 |
 | `message_type` | number \| null | 原始事件的 `message_type`，缺失时为 `null` |
-| `ref_msg_idx` | string \| null | 取自 `message_scene.ext` 里的 `ref_msg_idx=...`，没有则为 `null`。观测数据里，被 @ 且带自动上下文的群消息，这个值是 `TMP_` 前缀的上下文指针（不是真正的引用）；真实引用的结构尚未确认 |
-| `recent_context` | array | QQ 自动附带的最近群消息上下文，群被 @（`message_type` 103）且群设置开启「获取@机器人的最近10条消息」时有内容，否则为 `[]`；每项 `{ index, author, content, attachments }`，`author` 通常为 `null`（观测样本不含每条作者/id），`attachments` 每项 `{ content_type, url, local_path }`（图片会下载，`local_path` 成功为绝对路径、失败为 `null`）；这些上下文会以 `role: user` 并入群历史，且不计入 `quoted` |
+| `ref_msg_idx` | string \| null | 取自 `message_scene.ext` 里的 `ref_msg_idx=...`，没有则为 `null` |
 | `recent_images` | array | 该群最近 10 分钟内「非 @ 消息」里的图片，最多 5 张，按时间升序，每项 `{ local_path, nickname, timestamp }`；出现在被 @ 的群消息载荷上（没有缓存时为 `[]`），私聊载荷没有这个字段 |
 
 ## 回复接口
