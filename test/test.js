@@ -2,9 +2,12 @@
 const assert = require('assert'), http = require('http'), fs = require('fs'), os = require('os'), path = require('path');
 const HDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-history-'));
 process.env.QQ_HISTORY_DIR = HDIR;
+const MDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-memory-'));
+process.env.QQ_MEMORY_DIR = MDIR;
 const { toPayload, TokenManager, QQApi } = require('../lib');
 const { createReplyServer } = require('../reply_server');
 const { getHistory, append, historyKey, historyFile } = require('../history');
+const { memoryPath, memoryDir } = require('../memory');
 const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').trim().split('\n').filter(Boolean);
 (async () => {
   const c = toPayload('C2C_MESSAGE_CREATE', { id: 'm1', content: ' hi ', timestamp: 't', author: { user_openid: 'U' } });
@@ -79,6 +82,29 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(append('c2c', 'DIR', { role: 'user', content: 'x' }), null);
   assert.deepStrictEqual(getHistory('c2c', 'DIR'), []);
   assert.strictEqual(getHistory('c2c', 'U').length, 4);
+  // ---- memory: one markdown file per conversation, created empty on demand
+  assert.strictEqual(memoryDir(), MDIR);
+  assert.strictEqual(memoryPath('c2c', 'U'), path.join(MDIR, 'c2c-U.md'));
+  assert.strictEqual(memoryPath('group', 'G'), path.join(MDIR, 'group-G.md'));
+  assert.strictEqual(memoryPath('c2c', 'U/../x y'), path.join(MDIR, 'c2c-U____x_y.md'));
+  assert.ok(fs.existsSync(path.join(MDIR, 'c2c-U.md')));
+  assert.strictEqual(fs.readFileSync(path.join(MDIR, 'c2c-U.md'), 'utf8'), '');
+  // ---- memory: an existing file is never truncated or rewritten
+  fs.writeFileSync(path.join(MDIR, 'c2c-BU.md'), 'notes\n');
+  assert.strictEqual(memoryPath('c2c', 'BU'), path.join(MDIR, 'c2c-BU.md'));
+  assert.strictEqual(fs.readFileSync(path.join(MDIR, 'c2c-BU.md'), 'utf8'), 'notes\n');
+  assert.deepStrictEqual(fs.readdirSync(MDIR).sort(), ['c2c-BU.md', 'c2c-U.md', 'c2c-U____x_y.md', 'group-G.md']);
+  // ---- memory: QQ_MEMORY_DIR override, nested dirs created
+  const MDIR2 = path.join(MDIR, 'nested', 'deeper');
+  process.env.QQ_MEMORY_DIR = MDIR2;
+  assert.strictEqual(memoryPath('c2c', 'N'), path.join(MDIR2, 'c2c-N.md'));
+  assert.ok(fs.existsSync(path.join(MDIR2, 'c2c-N.md')));
+  process.env.QQ_MEMORY_DIR = MDIR;
+  // ---- memory: IO errors are non-fatal, the path is still returned
+  fs.writeFileSync(path.join(MDIR, 'notadir'), '');
+  process.env.QQ_MEMORY_DIR = path.join(MDIR, 'notadir', 'sub');
+  assert.strictEqual(memoryPath('c2c', 'U'), path.join(MDIR, 'notadir', 'sub', 'c2c-U.md'));
+  process.env.QQ_MEMORY_DIR = MDIR;
   const calls = []; let tokCalls = 0;
   const mock = http.createServer((req, res) => { let b = ''; req.on('data', d => b += d); req.on('end', () => {
     if (req.url === '/token') { tokCalls++; return res.end(JSON.stringify({ access_token: 'TK', expires_in: '7200' })); }
@@ -106,5 +132,5 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.deepStrictEqual(getHistory('group', 'BG').map(e => [e.role, e.content]), [['bot', 'group reply']]);
   assert.strictEqual((await post({ type: 'c2c', openid: 'BU', msg_id: 'b3', content: 'BOOM' })).status, 502);
   assert.strictEqual(getHistory('c2c', 'BU').length, 1);
-  console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true });
+  console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true }); fs.rmSync(MDIR, { recursive: true, force: true });
 })().catch(e => { console.error(e); process.exit(1); });

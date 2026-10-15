@@ -4,6 +4,7 @@ const fs = require('fs'), path = require('path');
 const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = require('./lib');
 const { createReplyServer } = require('./reply_server');
 const { getHistory, append } = require('./history');
+const { memoryPath } = require('./memory');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
 const cfg = loadConfig();
@@ -13,9 +14,10 @@ const srv = createReplyServer(api, loadReplyToken());
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
 
-// Attach the conversation history to a forwarded payload (before the current message is recorded), then record the current one.
+// Attach the conversation history and the long-term memory path to a forwarded payload (before the current message is recorded), then record the current one.
 function recordInbound(p) {
   const id = p.type === 'group' ? p.group_openid : p.openid;
+  p.memory_path = memoryPath(p.type, id);
   try {
     p.history = getHistory(p.type, id);
     append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
