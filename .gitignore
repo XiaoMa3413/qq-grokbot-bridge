@@ -3,3 +3,6 @@ logs/
 reply_token
 run.pid
 .env
+data/
+memory/*
+!memory/.gitkeep

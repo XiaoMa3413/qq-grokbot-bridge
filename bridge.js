@@ -3,6 +3,7 @@ const WebSocket = require('ws');
 const fs = require('fs'), path = require('path');
 const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi } = require('./lib');
 const { createReplyServer } = require('./reply_server');
+const { getHistory, append } = require('./history');
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
 const cfg = loadConfig();
@@ -12,6 +13,16 @@ const srv = createReplyServer(api, loadReplyToken());
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
 
+// Attach the conversation history to a forwarded payload (before the current message is recorded), then record the current one.
+function recordInbound(p) {
+  const id = p.type === 'group' ? p.group_openid : p.openid;
+  try {
+    p.history = getHistory(p.type, id);
+    append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
+      openid: (p.author && (p.author.user_openid || p.author.member_openid)) || null,
+      content: p.content, timestamp: p.timestamp || new Date().toISOString() });
+  } catch (e) { log('history error', e.message); if (!Array.isArray(p.history)) p.history = []; }
+}
 async function forward(p) {
   if (!cfg.forwardWebhookUrl) return;
   const h = { 'Content-Type': 'application/json' };
@@ -51,7 +62,7 @@ async function connect() {
               try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify({ t: m.t, d: m.d }) + '\n'); }
               catch (e) { log('raw event dump error', e.message); }
             }
-            const p = toPayload(m.t, m.d); if (p) { log('recv', p.type, p.msg_id); forward(p); } }
+            const p = toPayload(m.t, m.d); if (p) { log('recv', p.type, p.msg_id); recordInbound(p); forward(p); } }
       }
     });
     ws.on('close', (c, r) => { clearInterval(hb); log('ws closed', c, String(r)); if ([4914, 4915].includes(c)) { log('bot offline/banned, exit'); process.exit(1); } if ([4004, 4006, 4007, 4009].includes(c) || c >= 4900) { sessionId = null; seq = null; } schedule(); });

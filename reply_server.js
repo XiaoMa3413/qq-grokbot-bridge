@@ -1,6 +1,7 @@
 'use strict';
 const http = require('http');
 const { log } = require('./lib');
+const { append } = require('./history');
 function createReplyServer(api, token) {
   return http.createServer((req, res) => {
     const send = (c, o) => { res.writeHead(c, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -13,7 +14,9 @@ function createReplyServer(api, token) {
       const target = j.type === 'c2c' ? j.openid : j.type === 'group' ? j.group_openid : null;
       if (!target || typeof j.content !== 'string' || !j.content)
         return send(400, { ok: false, error: 'need type(c2c|group), openid|group_openid, content' });
-      try { const r = await api.send(j.type, target, j.content, j.msg_id); log('reply sent', j.type, j.msg_id || '(active)'); send(200, { ok: true, result: r }); }
+      try { const r = await api.send(j.type, target, j.content, j.msg_id); log('reply sent', j.type, j.msg_id || '(active)');
+        append(j.type, target, { role: 'bot', nickname: null, member_role: null, openid: null, content: j.content, timestamp: new Date().toISOString() });
+        send(200, { ok: true, result: r }); }
       catch (e) { log('reply failed', e.message, JSON.stringify(e.body || '')); send(502, { ok: false, error: e.message, detail: e.body }); }
     });
   });
