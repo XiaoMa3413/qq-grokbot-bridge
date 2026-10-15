@@ -4,5 +4,7 @@
   "replyPort": 8787,
   "apiBase": "https://api.sgroup.qq.com",
   "tokenUrl": "https://bots.qq.com/app/getAppAccessToken",
-  "intents": 33554432
+  "intents": 33554432,
+  "historyLimitC2c": 20,
+  "historyLimitGroup": 10
 }

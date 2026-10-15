@@ -20,7 +20,7 @@ flowchart LR
 
 - **私聊（C2C）**：处理 `C2C_MESSAGE_CREATE` 事件。
 - **群聊只在被 @ 时响应**：只订阅 `GROUP_AT_MESSAGE_CREATE`，其他群消息根本不会推送过来。
-- **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带最近 50 条记录（`history` 字段），不含当前这条。文件超过 60 条时裁剪回 50 条，每条内容最多保留 2000 字符。机器人发出的回复也会写入历史。
+- **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带该类型会话最近的若干条记录（`history` 字段），不含当前这条；默认私聊最近 20 条、群聊最近 10 条。文件条数超过「上限 + 10」时裁剪回上限（私聊超过 30 条裁到 20 条，群聊超过 20 条裁到 10 条），每条内容最多保留 2000 字符。上限可在 `config.json` 中用 `historyLimitC2c` / `historyLimitGroup` 配置。机器人发出的回复也会写入历史。
 - **会话记忆文件**：每个会话有一个 Markdown 文件，不存在时自动创建为空文件，路径通过 `memory_path` 交给智能体。桥接本身不读也不写其中内容，由智能体自行维护。
 - **图片附件**：`image/*` 附件会下载到本地（单张上限 20 MB，超时 15 秒），成功后在附件上写入 `local_path`（绝对路径），失败则为 `null`。下载失败不影响消息转发。
 - **长回复拆分**：超过 1500 字符的回复按段落（`\n\n`）、换行、硬切的优先级拆成多条。
@@ -59,11 +59,15 @@ flowchart LR
   "replyPort": 8787,
   "apiBase": "https://api.sgroup.qq.com",
   "tokenUrl": "https://bots.qq.com/app/getAppAccessToken",
-  "intents": 33554432
+  "intents": 33554432,
+  "historyLimitC2c": 20,
+  "historyLimitGroup": 10
 }
 ```
 
 `intents` 为 `1<<25`（GROUP_AND_C2C_EVENT）。`replyHost` 建议保持 `127.0.0.1`，不要对外暴露。
+
+`historyLimitC2c` / `historyLimitGroup`：转发时附带的对话历史条数上限，默认 20 / 10（缺省或非法值时回退到默认值）。历史文件超过「上限 + 10」条时裁剪回上限条。
 
 ## QQ 开放平台设置
 

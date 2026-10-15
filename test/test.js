@@ -9,7 +9,7 @@ process.env.QQ_MEDIA_DIR = MDIA;
 const { toPayload, TokenManager, QQApi } = require('../lib');
 const { createReplyServer } = require('../reply_server');
 const { downloadImages } = require('../media');
-const { getHistory, append, historyKey, historyFile } = require('../history');
+const { getHistory, append, historyKey, historyFile, historyLimit, trimAt } = require('../history');
 const { memoryPath, memoryDir } = require('../memory');
 const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').trim().split('\n').filter(Boolean);
 (async () => {
@@ -64,17 +64,31 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(getHistory('c2c', 'TC')[0].content.length, 2000);
   fs.appendFileSync(historyFile('c2c', 'BR'), 'not json\n{"role":"user","content":"ok"}\n\n');
   assert.deepStrictEqual(getHistory('c2c', 'BR').map(e => e.content), ['ok']);
-  // ---- history: keep the last 50 entries, rewrite past 60 lines
+  // ---- history: per-type limits from config.json (c2c 20 / trim 30, group 10 / trim 20)
+  assert.deepStrictEqual([historyLimit('c2c'), historyLimit('group'), historyLimit('other'), trimAt('c2c'), trimAt('group')], [20, 10, 20, 30, 20]);
+  // ---- history: group keeps the last 10 entries, rewrites past 20 lines
   for (let i = 0; i < 61; i++) append('group', 'TR', { role: 'user', content: 'x' + i, timestamp: 't' + i });
-  assert.strictEqual(fileLines('group', 'TR').length, 50);
-  assert.strictEqual(getHistory('group', 'TR').length, 50);
-  assert.strictEqual(getHistory('group', 'TR')[0].content, 'x11');
+  assert.strictEqual(fileLines('group', 'TR').length, 17);
+  assert.strictEqual(getHistory('group', 'TR').length, 10);
+  assert.strictEqual(getHistory('group', 'TR')[0].content, 'x51');
   for (let i = 0; i < 70; i++) append('group', 'CAP', { role: 'user', content: 'm' + i, timestamp: 't' + i });
   const capped = getHistory('group', 'CAP');
-  assert.strictEqual(capped.length, 50);
-  assert.strictEqual(capped[0].content, 'm20');
-  assert.strictEqual(capped[49].content, 'm69');
-  assert.ok(fileLines('group', 'CAP').length <= 60);
+  assert.strictEqual(capped.length, 10);
+  assert.strictEqual(capped[0].content, 'm60');
+  assert.strictEqual(capped[9].content, 'm69');
+  assert.ok(fileLines('group', 'CAP').length <= 20);
+  // ---- history: c2c uses the wider limit (keep 20, rewrite past 30)
+  for (let i = 0; i < 35; i++) append('c2c', 'TCAP', { role: 'user', content: 'c' + i, timestamp: 't' + i });
+  const tc = getHistory('c2c', 'TCAP');
+  assert.strictEqual(fileLines('c2c', 'TCAP').length, 24);
+  assert.strictEqual(tc.length, 20);
+  assert.strictEqual(tc[0].content, 'c15');
+  assert.strictEqual(tc[19].content, 'c34');
+  // ---- history: getHistory caps the entries returned, whatever the file holds
+  fs.appendFileSync(historyFile('c2c', 'RAW'), Array.from({ length: 25 }, (_, i) => JSON.stringify({ role: 'user', content: 'r' + i })).join('\n') + '\n');
+  assert.deepStrictEqual(getHistory('c2c', 'RAW').map(e => e.content), Array.from({ length: 20 }, (_, i) => 'r' + (i + 5)));
+  fs.appendFileSync(historyFile('group', 'RAWG'), Array.from({ length: 15 }, (_, i) => JSON.stringify({ role: 'user', content: 'g' + i })).join('\n') + '\n');
+  assert.deepStrictEqual(getHistory('group', 'RAWG').map(e => e.content), Array.from({ length: 10 }, (_, i) => 'g' + (i + 5)));
   // ---- history: IO errors are non-fatal
   const hd = process.env.QQ_HISTORY_DIR;
   fs.writeFileSync(path.join(HDIR, 'notadir'), ''); process.env.QQ_HISTORY_DIR = path.join(HDIR, 'notadir', 'sub');
