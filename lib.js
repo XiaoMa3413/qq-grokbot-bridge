@@ -69,5 +69,20 @@ class QQApi {
     if (msgId) { body.msg_id = msgId; body.msg_seq = this.nextSeq(msgId); }
     return this.req('POST', p, body);
   }
+  // Upload a local image as rich media. Returns the parsed response (which carries file_info for sendMedia).
+  uploadImage(type, target, buf, fileName) {
+    const p = type === 'c2c' ? `/v2/users/${encodeURIComponent(target)}/files`
+                             : `/v2/groups/${encodeURIComponent(target)}/files`;
+    const body = { file_type: 1, file_data: buf.toString('base64'), file_name: fileName, srv_send_msg: false };
+    return this.req('POST', p, body);
+  }
+  // Send an already-uploaded rich-media image (msg_type 7). fileInfo is the file_info from uploadImage.
+  sendMedia(type, target, fileInfo, msgId) {
+    const p = type === 'c2c' ? `/v2/users/${encodeURIComponent(target)}/messages`
+                             : `/v2/groups/${encodeURIComponent(target)}/messages`;
+    const body = { msg_type: 7, media: { file_info: fileInfo } };
+    if (msgId) { body.msg_id = msgId; body.msg_seq = this.nextSeq(msgId); }
+    return this.req('POST', p, body);
+  }
 }
 module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR };

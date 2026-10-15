@@ -119,7 +119,7 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
     let b = ''; req.on('data', d => b += d); req.on('end', () => {
     calls.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(b) });
     if (b.includes('BOOM')) { res.writeHead(500); return res.end('{"code":1,"message":"boom"}'); }
-    res.end('{"id":"x"}'); }); }).listen(0);
+    res.end(req.url.endsWith('/files') ? '{"file_info":"FI","ttl":3600}' : '{"id":"x"}'); }); }).listen(0);
   await new Promise(r => mock.on('listening', r)); const base = 'http://127.0.0.1:' + mock.address().port;
   const api = new QQApi({ apiBase: base }, new TokenManager({ tokenUrl: base + '/token' }, 'a', 's'));
   const srv = createReplyServer(api, 'T').listen(0); await new Promise(r => srv.on('listening', r));
@@ -282,5 +282,38 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   await downloadImages(p);
   assert.strictEqual(p.attachments[0].local_path, null);
   assert.strictEqual(p.attachments[1].local_path, path.join(MDIA, 'img5-1.jpg'));
+  // ---- image replies
+  {
+    const IDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-img-'));
+    const png = path.join(IDIR, 'a.png'); const pngBuf = Buffer.concat([Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]), Buffer.from('xyz')]); fs.writeFileSync(png, pngBuf);
+    const jpg = path.join(IDIR, 'b.jpg'); fs.writeFileSync(jpg, Buffer.from([0xff,0xd8,0xff,0xe0,9]));
+    const fake = path.join(IDIR, 'c.png'); fs.writeFileSync(fake, 'not png');
+    const gif = path.join(IDIR, 'd.gif'); fs.writeFileSync(gif, 'GIF89a');
+    const big = path.join(IDIR, 'e.png'); fs.writeFileSync(big, Buffer.alloc(5 * 1024 * 1024 + 1));
+    const n0 = calls.length;
+    for (const bad of [{ image: 'rel.png' }, { image: path.join(IDIR, 'none.png') }, { image: gif }, { image: big }, { image: fake }, { images: 'x' }, { image: IDIR + '.png' }])
+      assert.strictEqual((await post({ type: 'c2c', openid: 'IU', msg_id: 'iv', ...bad })).status, 400, JSON.stringify(bad));
+    assert.strictEqual(calls.length, n0, 'nothing sent on validation error');
+    let r = await post({ type: 'c2c', openid: 'IU', msg_id: 'i1', content: 'see pic', image: png }); let jr = await r.json();
+    assert.strictEqual(r.status, 200); assert.deepStrictEqual([jr.parts_sent, jr.images_sent, jr.images_total, jr.images_skipped], [1, 1, 1, 0]);
+    const ic = calls.slice(n0);
+    assert.deepStrictEqual(ic.map(x => x.url), ['/v2/users/IU/messages', '/v2/users/IU/files', '/v2/users/IU/messages']);
+    assert.deepStrictEqual(ic[1].body, { file_type: 1, file_data: pngBuf.toString('base64'), file_name: 'a.png', srv_send_msg: false });
+    assert.deepStrictEqual(ic[2].body, { msg_type: 7, media: { file_info: 'FI' }, msg_id: 'i1', msg_seq: 2 });
+    assert.ok(fileLines('c2c', 'IU').slice(-1)[0].includes('[图片] a.png'));
+    // image only, group, two images
+    const n1 = calls.length;
+    r = await post({ type: 'group', group_openid: 'IG', msg_id: 'i2', images: [png, jpg] }); jr = await r.json();
+    assert.strictEqual(r.status, 200); assert.deepStrictEqual([jr.parts_sent, jr.images_sent], [0, 2]);
+    assert.deepStrictEqual(calls.slice(n1).map(x => [x.url, x.body.msg_seq]), [['/v2/groups/IG/files', undefined], ['/v2/groups/IG/messages', 1], ['/v2/groups/IG/files', undefined], ['/v2/groups/IG/messages', 2]]);
+    // cap: c2c passive cap 4, 3 text already sent -> 1 image slot
+    for (const t of ['1', '2', '3']) await post({ type: 'c2c', openid: 'IU', msg_id: 'i3', content: t });
+    r = await post({ type: 'c2c', openid: 'IU', msg_id: 'i3', images: [png, jpg] }); jr = await r.json();
+    assert.deepStrictEqual([jr.images_sent, jr.images_skipped], [1, 1]);
+    // text-only responses unchanged (no image fields)
+    jr = await (await post({ type: 'c2c', openid: 'IU', msg_id: 'i4', content: 'plain' })).json();
+    assert.strictEqual(jr.images_sent, undefined);
+    fs.rmSync(IDIR, { recursive: true, force: true });
+  }
   console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true }); fs.rmSync(MDIR, { recursive: true, force: true }); fs.rmSync(MDIA, { recursive: true, force: true });
 })().catch(e => { console.error(e); process.exit(1); });

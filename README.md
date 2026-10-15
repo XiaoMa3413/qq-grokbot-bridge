@@ -117,6 +117,27 @@ mkdir -p logs
 
 群聊用 `"type": "group"` 和 `"group_openid"`。带上 `msg_id` 就是被动回复；不带则为主动消息，会受 QQ 主动消息配额限制。
 
+### 发送图片
+
+可以在请求里加 `image`（单个本地绝对路径）或 `images`（路径数组），文字 `content` 可选，图文可以同时发：
+
+```json
+{ "type": "group", "group_openid": "<group_openid>", "msg_id": "<msg_id>",
+  "content": "今天的简报", "images": ["/abs/path/briefing.png"] }
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/reply \
+  -H 'Content-Type: application/json' -H "X-Reply-Token: $(cat reply_token)" \
+  -d '{"type":"c2c","openid":"<openid>","msg_id":"<msg_id>","content":"看图","image":"/abs/path/a.png"}'
+```
+
+- 流程：先调用 `POST /v2/users/{openid}/files` 或 `/v2/groups/{group_openid}/files`（`file_type: 1`，`file_data` 为 base64，`srv_send_msg: false`）拿到 `file_info`，再发 `msg_type: 7` 的消息（`media.file_info`），带同一个 `msg_id` 和递增的 `msg_seq`。
+- 发送顺序：先发文字（按原规则分段），再逐张发图片。每张图片占一条消息配额，与文字共用被动回复上限（私聊 4 条、群聊 5 条 / msg_id；主动消息 5 条）；超出部分不发送，在响应里记为 `images_skipped`。
+- 校验（不通过返回 400，且什么都不发）：必须是绝对路径、文件存在、扩展名为 `.png`/`.jpg`/`.jpeg`、内容确实是 PNG/JPEG、大小不超过 5 MB（QQ 二进制直传上限）。
+- 带图片的请求，响应额外包含 `images_sent`、`images_total`、`images_skipped`；纯文字请求的响应格式不变。
+- 聊天记录里图片记为 `[图片] 文件名`。
+
 响应：
 
 ```json
@@ -134,6 +155,7 @@ mkdir -p logs
 ```bash
 ./reply.sh c2c <openid> <msg_id|-> 回复内容
 ./reply.sh group <group_openid> <msg_id|-> 回复内容
+IMAGE=/abs/path/a.png ./reply.sh c2c <openid> <msg_id|-> [文字|-]   # 附带一张图片
 ```
 
 `reply_token` 在首次启动时随机生成，文件权限为 600。
