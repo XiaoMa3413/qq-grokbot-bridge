@@ -4,8 +4,11 @@ const HDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-history-'));
 process.env.QQ_HISTORY_DIR = HDIR;
 const MDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-memory-'));
 process.env.QQ_MEMORY_DIR = MDIR;
+const MDIA = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-media-'));
+process.env.QQ_MEDIA_DIR = MDIA;
 const { toPayload, TokenManager, QQApi } = require('../lib');
 const { createReplyServer } = require('../reply_server');
+const { downloadImages } = require('../media');
 const { getHistory, append, historyKey, historyFile } = require('../history');
 const { memoryPath, memoryDir } = require('../memory');
 const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').trim().split('\n').filter(Boolean);
@@ -106,8 +109,14 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(memoryPath('c2c', 'U'), path.join(MDIR, 'notadir', 'sub', 'c2c-U.md'));
   process.env.QQ_MEMORY_DIR = MDIR;
   const calls = []; let tokCalls = 0;
-  const mock = http.createServer((req, res) => { let b = ''; req.on('data', d => b += d); req.on('end', () => {
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]), PNG = Buffer.from('PNGDATA');
+  const GIF = Buffer.from('GIF89a'), WEBP = Buffer.from('WEBPDATA');
+  const IMAGES = { '/i.jpg': ['image/jpeg', JPEG], '/i.png': ['image/png', PNG], '/i.gif': ['image/gif', GIF], '/i.webp': ['image/webp', WEBP], '/i.tiff': ['image/tiff', PNG] };
+  const mock = http.createServer((req, res) => {
     if (req.url === '/token') { tokCalls++; return res.end(JSON.stringify({ access_token: 'TK', expires_in: '7200' })); }
+    if (IMAGES[req.url]) { res.writeHead(200, { 'Content-Type': IMAGES[req.url][0] }); return res.end(IMAGES[req.url][1]); }
+    if (req.url === '/i.404') { res.writeHead(404); return res.end('nope'); }
+    let b = ''; req.on('data', d => b += d); req.on('end', () => {
     calls.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(b) });
     if (b.includes('BOOM')) { res.writeHead(500); return res.end('{"code":1,"message":"boom"}'); }
     res.end('{"id":"x"}'); }); }).listen(0);
@@ -132,5 +141,146 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.deepStrictEqual(getHistory('group', 'BG').map(e => [e.role, e.content]), [['bot', 'group reply']]);
   assert.strictEqual((await post({ type: 'c2c', openid: 'BU', msg_id: 'b3', content: 'BOOM' })).status, 502);
   assert.strictEqual(getHistory('c2c', 'BU').length, 1);
-  console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true }); fs.rmSync(MDIR, { recursive: true, force: true });
+  // ---- reply: short content goes out as a single message
+  const TRUNC = '\n…（内容过长，已截断）';
+  const n0 = calls.length;
+  let r = await post({ type: 'c2c', openid: 'SHORT', msg_id: 's1', content: 'hi there' });
+  assert.strictEqual(r.status, 200);
+  let j0 = await r.json();
+  assert.deepStrictEqual([j0.ok, j0.parts_sent, j0.parts_total, j0.truncated], [true, 1, 1, false]);
+  assert.deepStrictEqual(j0.results, [{ id: 'x' }]);
+  assert.deepStrictEqual(j0.result, j0.results[0]);
+  assert.strictEqual(calls.length, n0 + 1);
+  assert.strictEqual(calls[n0].url, '/v2/users/SHORT/messages');
+  assert.deepStrictEqual([calls[n0].body.content, calls[n0].body.msg_seq, calls[n0].body.msg_id], ['hi there', 1, 's1']);
+  assert.deepStrictEqual(getHistory('c2c', 'SHORT').map(e => [e.role, e.content]), [['bot', 'hi there']]);
+  // ---- reply: long content splits on paragraph boundaries, one history entry
+  const para = 'A'.repeat(1000) + '\n\n' + 'B'.repeat(501);
+  r = await post({ type: 'c2c', openid: 'SP', msg_id: 'p1', content: para });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.strictEqual(para.length, 1503);
+  assert.deepStrictEqual([j0.ok, j0.parts_sent, j0.parts_total, j0.truncated], [true, 2, 2, false]);
+  assert.strictEqual(calls.length, n0 + 3);
+  assert.deepStrictEqual([calls[n0 + 1].body.content, calls[n0 + 1].body.msg_seq], ['A'.repeat(1000) + '\n\n', 1]);
+  assert.deepStrictEqual([calls[n0 + 2].body.content, calls[n0 + 2].body.msg_seq], ['B'.repeat(501), 2]);
+  const sph = getHistory('c2c', 'SP');
+  assert.strictEqual(sph.length, 1);
+  assert.strictEqual(sph[0].role, 'bot');
+  assert.strictEqual(sph[0].content, para);
+  // ---- reply: line (\n) boundaries, then a hard cut
+  const liney = ['L'.repeat(600), 'L'.repeat(600), 'L'.repeat(600), 'H'.repeat(2000)].join('\n');
+  r = await post({ type: 'c2c', openid: 'SL', msg_id: 'l1', content: liney });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.deepStrictEqual([j0.parts_sent, j0.parts_total, j0.truncated], [4, 4, false]);
+  assert.ok(j0.results.every(x => x.id === 'x'));
+  assert.deepStrictEqual(calls.slice(-4).map(x => x.body.content),
+    ['L'.repeat(600) + '\n' + 'L'.repeat(600) + '\n', 'L'.repeat(600) + '\n', 'H'.repeat(1500), 'H'.repeat(500)]);
+  assert.strictEqual(getHistory('c2c', 'SL').length, 1);
+  // ---- reply: c2c passive cap is 4 messages per msg_id, last one truncated
+  const many = n => Array.from({ length: n }, (_, i) => String.fromCharCode(65 + i).repeat(800)).join('\n\n');
+  const long12 = many(12);
+  const n1 = calls.length;
+  r = await post({ type: 'c2c', openid: 'CCAP', msg_id: 'c1', content: long12 });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.deepStrictEqual([j0.ok, j0.parts_sent, j0.parts_total, j0.truncated], [true, 4, 12, true]);
+  const cap1 = calls.slice(n1);
+  assert.deepStrictEqual(cap1.map(x => x.body.msg_seq), [1, 2, 3, 4]);
+  assert.ok(cap1.slice(0, 3).every(x => x.body.content.length <= 1500));
+  assert.strictEqual(cap1[3].body.content, 'D'.repeat(800) + '\n\n' + TRUNC);
+  assert.ok(cap1[3].body.content.startsWith('D') && cap1[3].body.content.length <= 1500);
+  const cap1Sent = cap1.map(x => x.body.content).join('');
+  assert.strictEqual(cap1Sent.length, 802 * 3 + 814);
+  assert.deepStrictEqual(getHistory('c2c', 'CCAP').map(e => e.content), [cap1Sent.slice(0, 2000)]);
+  // ---- reply: the cap counts messages already sent for this msg_id
+  const n2 = calls.length;
+  assert.strictEqual((await post({ type: 'c2c', openid: 'CCAP', msg_id: 'c1', content: 'short one' })).status, 200);
+  assert.strictEqual(calls.length, n2);  // 4 already sent, nothing left
+  assert.deepStrictEqual(await (await post({ type: 'c2c', openid: 'CCAP', msg_id: 'c1', content: 'again' })).json(),
+    { ok: true, parts_sent: 0, parts_total: 1, truncated: true, result: null, results: [] });
+  const n3 = calls.length;
+  assert.strictEqual((await post({ type: 'c2c', openid: 'CAPX', msg_id: 'x1', content: 'one' })).status, 200);
+  r = await post({ type: 'c2c', openid: 'CAPX', msg_id: 'x1', content: long12 });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.deepStrictEqual([j0.parts_sent, j0.parts_total, j0.truncated], [3, 12, true]);  // 1 already sent, 3 left
+  assert.deepStrictEqual(calls.slice(n3 + 1).map(x => [x.body.content[0], x.body.msg_seq]), [['A', 2], ['B', 3], ['C', 4]]);
+  assert.strictEqual(calls[n3 + 3].body.content, 'C'.repeat(800) + '\n\n' + TRUNC);
+  assert.strictEqual((await post({ type: 'c2c', openid: 'CAPX', msg_id: 'x1', content: 'two' })).status, 200);
+  assert.strictEqual(calls.length, n3 + 4);  // 4 messages is the c2c cap, nothing left
+  const capxSent = calls.slice(n3 + 1, n3 + 4).map(x => x.body.content).join('');
+  assert.deepStrictEqual(getHistory('c2c', 'CAPX').map(e => e.content), ['one', capxSent.slice(0, 2000)]);
+  // ---- reply: group passive cap is 5 messages per msg_id
+  const n4 = calls.length;
+  r = await post({ type: 'group', group_openid: 'GCAP', msg_id: 'g1', content: long12 });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.deepStrictEqual([j0.parts_sent, j0.parts_total, j0.truncated], [5, 12, true]);
+  assert.deepStrictEqual(calls.slice(n4).map(x => x.url), Array(5).fill('/v2/groups/GCAP/messages'));
+  assert.deepStrictEqual(calls.slice(n4).map(x => x.body.msg_seq), [1, 2, 3, 4, 5]);
+  assert.ok(calls[n4 + 4].body.content.endsWith('\n…（内容过长，已截断）'));
+  // ---- reply: active (no msg_id) is capped at 5 chunks, no msg_id/msg_seq
+  const n5 = calls.length;
+  r = await post({ type: 'c2c', openid: 'ACT', content: long12 });
+  assert.strictEqual(r.status, 200); j0 = await r.json();
+  assert.deepStrictEqual([j0.parts_sent, j0.parts_total, j0.truncated], [5, 12, true]);
+  const act = calls.slice(n5);
+  assert.ok(act.every(x => x.body.msg_id === undefined && x.body.msg_seq === undefined));
+  assert.ok(act[4].body.content.endsWith('\n…（内容过长，已截断）'));
+  assert.strictEqual(getHistory('c2c', 'ACT').length, 1);
+  // ---- reply: a later part failing stops the sequence, sent parts are recorded
+  const n6 = calls.length;
+  r = await post({ type: 'c2c', openid: 'FAIL', msg_id: 'f1', content: 'A'.repeat(1000) + '\n\n' + 'BOOM' + 'B'.repeat(600) });
+  assert.strictEqual(r.status, 502); j0 = await r.json();
+  assert.deepStrictEqual([j0.ok, j0.parts_sent, j0.parts_total, j0.truncated], [false, 1, 2, false]);
+  assert.strictEqual(j0.error, 'QQ API 500');
+  assert.ok(j0.detail);
+  assert.strictEqual(calls.length, n6 + 2);  // the failing part also hit the API
+  assert.ok(calls[n6 + 1].body.content.includes('BOOM'));
+  assert.deepStrictEqual(getHistory('c2c', 'FAIL').map(e => e.content), ['A'.repeat(1000) + '\n\n']);
+  // ---- media: image attachments download to QQ_MEDIA_DIR as <msg_id>-<i>.<ext>
+  let p = { msg_id: 'img-1', attachments: [{ content_type: 'image/jpeg', url: base + '/i.jpg' }] };
+  await downloadImages(p);
+  assert.strictEqual(p.attachments[0].local_path, path.join(MDIA, 'img-1-0.jpg'));
+  assert.ok(path.isAbsolute(p.attachments[0].local_path));
+  assert.ok(fs.readFileSync(p.attachments[0].local_path).equals(JPEG));
+  assert.deepStrictEqual(fs.readdirSync(MDIA), ['img-1-0.jpg']);
+  // ---- media: protocol-relative urls get the https: prefix
+  const realFetch = global.fetch; let seenUrl = null;
+  global.fetch = (u, o) => { seenUrl = String(u); return realFetch(base + '/i.png', o); };
+  try {
+    p = { msg_id: 'img2', attachments: [{ content_type: 'image/png', url: '//127.0.0.1:' + mock.address().port + '/i.png' }] };
+    await downloadImages(p);
+    assert.strictEqual(seenUrl, 'https://127.0.0.1:' + mock.address().port + '/i.png');
+    assert.strictEqual(p.attachments[0].local_path, path.join(MDIA, 'img2-0.png'));
+    assert.ok(fs.readFileSync(p.attachments[0].local_path).equals(PNG));
+  } finally { global.fetch = realFetch; }
+  // ---- media: extension follows content_type, unknown subtypes fall back to .bin
+  p = { msg_id: 'img3', attachments: [
+    { content_type: 'image/gif', url: base + '/i.gif' },
+    { content_type: 'image/webp', url: base + '/i.webp' },
+    { content_type: 'image/tiff', url: base + '/i.tiff' }] };
+  await downloadImages(p);
+  assert.deepStrictEqual(p.attachments.map(a => path.basename(a.local_path)), ['img3-0.gif', 'img3-1.webp', 'img3-2.bin']);
+  assert.ok(fs.readFileSync(p.attachments[1].local_path).equals(WEBP));
+  assert.ok(fs.readFileSync(p.attachments[2].local_path).equals(PNG));
+  // ---- media: msg_id is sanitized into the file name
+  p = { msg_id: 'X/Y Z', attachments: [{ content_type: 'image/jpeg', url: base + '/i.jpg' }] };
+  await downloadImages(p);
+  assert.strictEqual(p.attachments[0].local_path, path.join(MDIA, 'X_Y_Z-0.jpg'));
+  // ---- media: non-images are skipped, missing url is a failure, failures are non-fatal
+  p = { msg_id: 'img4', attachments: [
+    { content_type: 'video/mp4', url: base + '/i.jpg' },
+    { content_type: 'image/png' },
+    { content_type: 'image/jpeg', url: base + '/i.404' },
+    { content_type: 'image/jpeg', url: 'http://127.0.0.1:1/nope.jpg' }] };
+  await downloadImages(p);
+  assert.ok(!('local_path' in p.attachments[0]));
+  assert.strictEqual(p.attachments[1].local_path, null);
+  assert.strictEqual(p.attachments[2].local_path, null);
+  assert.strictEqual(p.attachments[3].local_path, null);
+  p = { msg_id: 'img5', attachments: [
+    { content_type: 'image/jpeg', url: base + '/i.404' },
+    { content_type: 'image/jpeg', url: base + '/i.jpg' }] };
+  await downloadImages(p);
+  assert.strictEqual(p.attachments[0].local_path, null);
+  assert.strictEqual(p.attachments[1].local_path, path.join(MDIA, 'img5-1.jpg'));
+  console.log('ALL TESTS PASSED'); srv.close(); mock.close(); fs.rmSync(HDIR, { recursive: true, force: true }); fs.rmSync(MDIR, { recursive: true, force: true }); fs.rmSync(MDIA, { recursive: true, force: true });
 })().catch(e => { console.error(e); process.exit(1); });
