@@ -20,7 +20,7 @@ function normalizeEntry(e) {
     timestamp: x.timestamp == null || x.timestamp === '' ? new Date().toISOString() : String(x.timestamp) };
 }
 function getHistory(type, id) {
-  try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')); }
+  try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')).slice(-MAX_ENTRIES); }
   catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
 }
 function append(type, id, entry) {

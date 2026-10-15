@@ -71,7 +71,7 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.ok(fileLines('group', 'CAP').length <= 60);
   // ---- history: IO errors are non-fatal
   const hd = process.env.QQ_HISTORY_DIR;
-  process.env.QQ_HISTORY_DIR = '/proc/qq-bridge-history-test';
+  fs.writeFileSync(path.join(HDIR, 'notadir'), ''); process.env.QQ_HISTORY_DIR = path.join(HDIR, 'notadir', 'sub');
   assert.strictEqual(append('c2c', 'U', { role: 'user', content: 'x' }), null);
   assert.deepStrictEqual(getHistory('c2c', 'U'), []);
   process.env.QQ_HISTORY_DIR = hd;
