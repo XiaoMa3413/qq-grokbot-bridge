@@ -58,10 +58,13 @@ function loadImages(j) {
   }
   return { files };
 }
-function createReplyServer(api, token) {
+function createReplyServer(api, token, getHealth) {
   return http.createServer((req, res) => {
     const send = (c, o) => { res.writeHead(c, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
-    if (req.method === 'GET' && req.url === '/health') return send(200, { ok: true });
+    if (req.method === 'GET' && req.url === '/health') {
+      const h = getHealth ? getHealth() : { ok: true };
+      return send(h.ok ? 200 : 503, h);
+    }
     if (req.method !== 'POST' || req.url !== '/reply') return send(404, { ok: false, error: 'not found' });
     if (req.headers['x-reply-token'] !== token) return send(401, { ok: false, error: 'bad token' });
     let b = ''; req.on('data', c => { b += c; if (b.length > 1e6) req.destroy(); });

@@ -11,6 +11,7 @@ const { toPayload, TokenManager, QQApi } = require('../lib');
 const { Watchdog } = require('../watchdog');
 const { parseElements, refMsgIdx } = require('../events');
 const { createReplyServer } = require('../reply_server');
+const { checkLiveness, detectClockJump } = require('../liveness');
 const { downloadImages } = require('../media');
 const { getHistory, append, historyKey, historyFile, historyLimit, trimAt, mergeRecent } = require('../history');
 const { memoryPath, memoryDir } = require('../memory');
@@ -345,15 +346,16 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.ok(fs.readFileSync(p.attachments[0].local_path).equals(JPEG));
   assert.deepStrictEqual(fs.readdirSync(MDIA), ['img-1-0.jpg']);
   // ---- media: protocol-relative urls get the https: prefix
-  const realFetch = global.fetch; let seenUrl = null;
-  global.fetch = (u, o) => { seenUrl = String(u); return realFetch(base + '/i.png', o); };
+  const libMod = require('../lib');
+  const realFetch = libMod.fetch; let seenUrl = null;
+  libMod.fetch = (u, o) => { seenUrl = String(u); return realFetch(base + '/i.png', o); };
   try {
     p = { msg_id: 'img2', attachments: [{ content_type: 'image/png', url: '//127.0.0.1:' + mock.address().port + '/i.png' }] };
     await downloadImages(p);
     assert.strictEqual(seenUrl, 'https://127.0.0.1:' + mock.address().port + '/i.png');
     assert.strictEqual(p.attachments[0].local_path, path.join(MDIA, 'img2-0.png'));
     assert.ok(fs.readFileSync(p.attachments[0].local_path).equals(PNG));
-  } finally { global.fetch = realFetch; }
+  } finally { libMod.fetch = realFetch; }
   // ---- media: extension follows content_type, unknown subtypes fall back to .bin
   p = { msg_id: 'img3', attachments: [
     { content_type: 'image/gif', url: base + '/i.gif' },
@@ -464,6 +466,59 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
     fired = null;
     w.arm(40, 'wait'); w.disarm(); await sleep(90);
     assert.strictEqual(fired, null);                      // disarmed before it could fire
+  }
+  // ---- liveness: checkLiveness decides ok / reason / age, on the wall clock only
+  {
+    const t0 = Date.now();
+    const ok = checkLiveness({ wsState: 1, lastAliveAt: t0, now: t0, maxAgeMs: 1000 });
+    assert.deepStrictEqual([ok.ok, ok.reason, ok.ageMs], [true, '', 0]);
+    const connecting = checkLiveness({ wsState: 0, lastAliveAt: t0, now: t0 + 10, maxAgeMs: 1000 });
+    assert.deepStrictEqual([connecting.ok, connecting.reason, connecting.ageMs], [false, 'ws-not-open', 10]);
+    const closed = checkLiveness({ wsState: 3, lastAliveAt: t0, now: t0, maxAgeMs: 1000 });
+    assert.deepStrictEqual([closed.ok, closed.reason], [false, 'ws-not-open']);
+    const stale = checkLiveness({ wsState: 1, lastAliveAt: t0, now: t0 + 2000, maxAgeMs: 1000 });
+    assert.deepStrictEqual([stale.ok, stale.reason, stale.ageMs], [false, 'stale', 2000]);
+    const fresh = checkLiveness({ wsState: 1, lastAliveAt: t0, now: t0 + 500, maxAgeMs: 1000 });
+    assert.deepStrictEqual([fresh.ok, fresh.reason, fresh.ageMs], [true, '', 500]);
+  }
+  // ---- liveness: detectClockJump detects a suspended or fast-forwarded clock, past the threshold only
+  {
+    const t0 = Date.now();
+    // a normal heartbeat interval stays well inside the threshold
+    const normal = detectClockJump(t0, t0 + 15000, 15000);
+    assert.strictEqual(normal, false);
+    // a jump/suspend far beyond the threshold is detected (drift = elapsed - interval)
+    const jumped = t0 + 15000 + 60000;
+    assert.strictEqual(detectClockJump(t0, jumped, 15000), true);
+    // ...but not one within the threshold
+    const near = t0 + 15000 + 1000;
+    assert.strictEqual(detectClockJump(t0, near, 15000), false);
+    // the threshold itself is configurable
+    assert.strictEqual(detectClockJump(t0, jumped, 15000, 120000), false);
+  }
+  // ---- /health: getHealth drives the payload; not ok reports 503, ok reports 200, absent keeps {ok:true}
+  {
+    const bad = createReplyServer(api, 'T', () => ({ ok: false, ws_state: 'OPEN', last_ack_age_ms: 12345, reason: 'stale' }));
+    await new Promise(r => bad.listen(0, r));
+    const rh = await fetch(`http://127.0.0.1:${bad.address().port}/health`);
+    assert.strictEqual(rh.status, 503);
+    const hj = await rh.json();
+    assert.deepStrictEqual([hj.ok, hj.ws_state, hj.last_ack_age_ms, hj.reason], [false, 'OPEN', 12345, 'stale']);
+    bad.close();
+  }
+  {
+    const good = createReplyServer(api, 'T', () => ({ ok: true, ws_state: 'OPEN', last_ack_age_ms: 0, reason: '' }));
+    await new Promise(r => good.listen(0, r));
+    const rg = await fetch(`http://127.0.0.1:${good.address().port}/health`);
+    assert.strictEqual(rg.status, 200);
+    const gj = await rg.json();
+    assert.deepStrictEqual([gj.ok, gj.ws_state, gj.last_ack_age_ms, gj.reason], [true, 'OPEN', 0, '']);
+    good.close();
+  }
+  {
+    const rg0 = await fetch(`http://127.0.0.1:${srv.address().port}/health`);
+    assert.strictEqual(rg0.status, 200);
+    assert.deepStrictEqual(await rg0.json(), { ok: true });
   }
   // ---- lib.js fetch timeout: a server that never responds is aborted into an ETIMEDOUT error
   {

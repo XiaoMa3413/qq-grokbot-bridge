@@ -115,6 +115,11 @@ QQ_DEBUG_RAW_EVENTS=1 ./start.sh
   1. 60 秒内没有收到 `READY` 或 `RESUMED`（超时可用 `QQ_READY_TIMEOUT_MS` 调整）；
   2. 心跳连续 2 个周期没有收到服务端 ACK。
 - **日志同步写入**：日志用同步写标准输出再重定向到 `logs/bridge.log`，被看门狗或异常强制退出时不会丢行，多行之间也不会交错。
+- 独立存活检查：每 15 秒检查一次，ws 不是 OPEN 或距最近一次 READY/RESUMED/心跳 ACK 超过 90 秒（QQ_LIVENESS_MAX_AGE_MS 可调）就退出，由 run_loop.sh 重启。
+- 暂停感知：定时器漂移超过 30 秒（虚拟机暂停/休眠、时钟跳变）时立即退出并重连。
+- GET /health 返回 {ok, ws_state, last_ack_age_ms, reason}，不健康时返回 HTTP 503。
+- run_loop.sh 外部监控：每 30 秒请求 /health，连续 3 次失败，或失败且 bridge.log 10 分钟未更新时，kill -9 node。
+- 所有出站请求走 undici Agent（连接超时 10 秒、响应头/体超时 15 秒），并带 15 秒 AbortSignal。
 
 ## Webhook 转发格式
 

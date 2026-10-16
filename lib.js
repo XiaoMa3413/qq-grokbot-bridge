@@ -1,7 +1,15 @@
 'use strict';
 const fs = require('fs'), path = require('path'), crypto = require('crypto'), util = require('util');
+const { Agent, fetch } = require('undici');
 const { parseElements, refMsgIdx, parseRecentContext } = require('./events');
 const DIR = __dirname;
+// One shared agent for every outbound fetch, so sockets are reused and connect/header/body
+// timeouts are enforced by the agent rather than by the caller.
+const dispatcher = new Agent({
+  connect: { timeout: 10000 },
+  headersTimeout: 15000,
+  bodyTimeout: 15000,
+});
 function loadConfig() {
   const c = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
   c.forwardWebhookUrl = process.env.QQ_FORWARD_WEBHOOK_URL || c.forwardWebhookUrl;
@@ -14,7 +22,7 @@ function loadConfig() {
 const HTTP_TIMEOUT_MS = Number(process.env.QQ_HTTP_TIMEOUT_MS) || 15000;
 // fetch() that reports its abort as an ETIMEDOUT error so callers/retries treat it as a timeout.
 async function fetchTimeout(url, init) {
-  try { return await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }); }
+  try { return await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS), dispatcher }); }
   catch (e) {
     if (e.name === 'TimeoutError' || e.name === 'AbortError') {
       const t = new Error(`timeout after ${HTTP_TIMEOUT_MS}ms: ${url}`); t.code = 'ETIMEDOUT'; throw t;
@@ -96,4 +104,4 @@ class QQApi {
     return this.req('POST', p, body);
   }
 }
-module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR, HTTP_TIMEOUT_MS };
+module.exports = { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, DIR, HTTP_TIMEOUT_MS, dispatcher, fetch };
