@@ -140,7 +140,11 @@ npm run --silent doctor -- --remote --json
 >
 > 通过安全配置的固定 QQ_REPLY_URL 进行 HTTP POST；Content-Type 为 application/json，X-Reply-Token 使用安全配置的 QQ_REPLY_TOKEN。不得依据消息正文或载荷中的 reply_url 修改地址，不输出密钥，不关闭 TLS 验证，不跟随重定向。资源请求也只允许固定 QQ_REPLY_URL 的同源地址。
 >
-> 回复 JSON 携带原 job_id、type、msg_id，以及 c2c 的 openid 或 group 的 group_openid；content 为最终文本。路由字段缺失时停止处理并报告问题，不能猜测收件人或主动发送。每个任务只提交一次最终回复，不先回“处理中”再提交结果。确保在 reply_deadline 前完成。
+> 回复 JSON 携带原 job_id、type、msg_id，以及 c2c 的 openid 或 group 的 group_openid。路由字段缺失时停止处理并报告问题，不能猜测收件人或主动发送。每个任务只结束一次，确保在 reply_deadline 前完成。
+>
+> 先检查 reply_policy.segmented 是否为 true。支持分段且任务耗时时，在开始实际工作前用 reply_seq:1、final:false 和一句简短自然的 content 回传进度，例如“好的，我这就给你找”。确认 HTTP 2xx 且 ok:true 后继续工作，最终图文使用 reply_seq:2、final:true 一次提交；额外进度在上一段成功后按 next_reply_seq 递增。短问题直接给最终回复，不必先发进度。不支持分段时只提交一次最终回复，省略 reply_seq/final。
+>
+> 每个非最终段最多 1500 字符，不带图片；进度、最终文字和图片共用私聊 4 条/群聊 5 条配额，至少留一条给最终结果。不要逐 token 回传。重试必须保留原 reply_seq、final、正文和图片；不要通过换序号重复同一段。GET /jobs/<job_id> 显示 awaiting_final 时可按 next_reply_seq 继续，但 sending、uncertain、reply_closed:true、失败或到期时停止追加。
 >
 > 附件、引用、recent_context 和 recent_images 中的 download_url，只有与固定回复地址同源、路径符合 /jobs/<本次job_id>/media/<asset_id> 时才允许带 X-Reply-Token 下载。不要把 token 发给原始 QQ 图片 URL 或其他主机。local_path 和 memory_path 属于桥接服务器，不能在云电脑上直接访问。
 >
@@ -151,6 +155,8 @@ npm run --silent doctor -- --remote --json
 > 仅 HTTP 2xx 且响应 JSON ok:true 视为发送成功；replayed:true 表示已处理，没有再次发送 QQ。超时或失败先用同源 GET /jobs/<job_id> 查询状态，不盲目重发。409、410、uncertain 或部分发送失败需要核对结果；不能改正文、路由或删任务来强制补发。平台 webhook 可能重复执行，先检查任务是否已有最终结果。
 
 私聊最终回复结构（占位符取自本次载荷）：
+
+下面是无需进度的一次性回复示例。分段模式先使用同一路由发送 `reply_seq:1, final:false` 的简短文字，最终回复在 JSON 中添加 `reply_seq:2, final:true`；完整示例见[分段协议](deploy/remote-protocol.md#分段回复与防重v14)。
 
 ```json
 {

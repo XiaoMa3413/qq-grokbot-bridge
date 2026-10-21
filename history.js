@@ -21,6 +21,11 @@ function normalizeEntry(e) {
     timestamp: x.timestamp == null || x.timestamp === '' ? new Date().toISOString() : String(x.timestamp) };
   if (x.id != null && x.id !== '') out.id = prim(x.id); // optional; only present when the source carries one
   if (x.msg_id != null && x.msg_id !== '') out.msg_id = prim(x.msg_id); // optional; only present when the source carries one
+  if (x.role === 'bot' && ['progress', 'final'].includes(x.reply_kind)) {
+    out.reply_kind = x.reply_kind;
+    if (typeof x.job_id === 'string') out.job_id = x.job_id;
+    if (Number.isInteger(x.reply_seq)) out.reply_seq = x.reply_seq;
+  }
   return out;
 }
 // Per-type entry limits, read from config.json (historyLimitC2c / historyLimitGroup), defaulting to 20 / 10.
@@ -34,7 +39,7 @@ function configLimits() {
 function historyLimit(type) { const l = configLimits(); return type === 'group' ? l.group : l.c2c; }
 function trimAt(type) { return historyLimit(type) + 10; }
 function getHistory(type, id) {
-  try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')).slice(-historyLimit(type)); }
+  try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')).filter(e => e.reply_kind !== 'progress').slice(-historyLimit(type)); }
   catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
 }
 // Read every entry in the file (untouched by the per-type limit) for mergeRecent dedup.
@@ -50,7 +55,11 @@ function append(type, id, entry) {
     fs.appendFileSync(f, JSON.stringify(e) + '\n');
     let raw = ''; try { raw = fs.readFileSync(f, 'utf8'); } catch (er) { log('history read error', f, er.message); }
     const lines = parseEntries(raw);
-    if (lines.length > trim) fs.writeFileSync(f, lines.slice(-limit).map(x => JSON.stringify(x)).join('\n') + '\n');
+    if (lines.length > trim) {
+      const keep = new Set([...lines.filter(x => x.reply_kind !== 'progress').slice(-limit),
+        ...lines.filter(x => x.reply_kind === 'progress').slice(-5)]);
+      fs.writeFileSync(f, lines.filter(x => keep.has(x)).map(x => JSON.stringify(x)).join('\n') + '\n');
+    }
     return e;
   } catch (e) { log('history append error', e.message); return null; }
 }

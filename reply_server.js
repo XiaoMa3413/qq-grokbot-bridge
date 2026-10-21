@@ -3,6 +3,7 @@ const http = require('http'), fs = require('fs'), path = require('path');
 const { log } = require('./lib');
 const { append } = require('./history');
 const { decodeImages, replyFingerprint } = require('./remote');
+const { repliesOf } = require('./jobs');
 const MAX_LEN = 1500;                        // QQ message content limit we split at
 const TRUNC_NOTE = '\n…（内容过长，已截断）';
 const ACTIVE_MAX = 5;                        // active (no msg_id): at most 5 messages
@@ -99,9 +100,20 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
       if (imgs.error) return send(400, { ok: false, error: imgs.error });
       const job = store ? store.findReply(j) : null;
       if (store && !job) return send(404, { ok: false, error: 'unknown message route or job_id' });
+      const seq = j.reply_seq === undefined ? 1 : j.reply_seq, final = j.final === undefined ? true : j.final;
+      if ((j.reply_seq !== undefined || j.final !== undefined) && !store)
+        return send(400, { ok: false, error: 'segmented replies require durable remote mode' });
+      if (!Number.isInteger(seq) || seq < 1 || seq > 5 || typeof final !== 'boolean' || (!final && j.reply_seq === undefined))
+        return send(400, { ok: false, error: 'reply_seq must be an integer from 1 to 5; final must be boolean; progress requires reply_seq' });
+      if (!final && (!hasText || j.content.length > MAX_LEN || hasImg))
+        return send(400, { ok: false, error: 'progress must be a single text message of at most 1500 characters, without images' });
+      const cap = j.msg_id ? (PASSIVE_CAP[j.type] || ACTIVE_MAX) : ACTIVE_MAX;
+      const used = Math.max(j.msg_id ? (api.seq.get(j.msg_id) || 0) : 0, job?.sentCount || 0);
+      if (job && !repliesOf(job)[seq - 1] && used >= cap - (final ? 0 : 1))
+        return send(409, { ok: false, error: final ? 'QQ reply quota exhausted' : 'reserve at least one QQ message for the final reply', messages_remaining: Math.max(0, cap - used) });
       if (job) {
         try {
-          const cached = store.beginReply(job, replyFingerprint(j, imgs.files));
+          const cached = store.beginReply(job, replyFingerprint(j, imgs.files), { seq, final });
           if (cached) return send(cached.status, cached.body);
         } catch { return send(503, { ok: false, error: 'cannot persist reply intent; no message sent' }); }
       }
@@ -116,14 +128,22 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
         send(status, body);
       };
       try {
-        const sentBefore = j.msg_id ? (api.seq.get(j.msg_id) || 0) : 0;
+        const sentBefore = used;
         const plan = hasText ? planParts(j.content, j.type, j.msg_id, sentBefore) : { parts: [], total: 0, truncated: false };
-        const cap = j.msg_id ? (PASSIVE_CAP[j.type] || ACTIVE_MAX) : ACTIVE_MAX;
         const imgSlots = Math.max(0, cap - sentBefore - plan.parts.length);
         const toSend = imgs.files.slice(0, imgSlots), imagesSent = [];
         const results = []; let failure = null;
+        const reserve = () => {
+          if (!job) return;
+          if (store.now() >= job.deadline) throw new Error('QQ reply window expired');
+          // Reserve each platform sequence durably before its side effect, including across restarts.
+          const count = Math.max(job.sentCount || 0, api.seq.get(j.msg_id) || 0) + 1;
+          if (count > cap) throw new Error('QQ reply quota exhausted');
+          store.save({ ...job, sentCount: count }); job.sentCount = count;
+          api.seq.set(j.msg_id, count - 1);
+        };
         for (const part of plan.parts) {
-          try { results.push(await api.send(j.type, target, part, j.msg_id)); }
+          try { reserve(); results.push(await api.send(j.type, target, part, j.msg_id)); }
           catch (e) { failure = e; break; }
         }
         const parts_sent = results.length;
@@ -131,15 +151,17 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
           try {
             const up = await api.uploadImage(j.type, target, im.buf, im.name);
             if (!up || !up.file_info) { const e = new Error('upload returned no file_info'); e.body = up; throw e; }
-            results.push(await api.sendMedia(j.type, target, up.file_info, j.msg_id)); imagesSent.push(im.name);
+            reserve(); results.push(await api.sendMedia(j.type, target, up.file_info, j.msg_id)); imagesSent.push(im.name);
           } catch (e) { failure = e; break; }
         }
         const histText = [plan.parts.slice(0, parts_sent).join('')].concat(imagesSent.map(n => '[图片] ' + n)).filter(Boolean).join('\n');
         if (parts_sent || imagesSent.length) append(j.type, target, { role: 'bot', nickname: null, member_role: null, openid: null,
-          content: histText, timestamp: new Date().toISOString() });
+          content: histText, timestamp: new Date().toISOString(), ...(job ? { reply_kind: final ? 'final' : 'progress', job_id: job.id, reply_seq: seq } : {}) });
         log('reply done', j.type, j.msg_id || '(active)', parts_sent + '/' + plan.total + (plan.truncated ? ' truncated' : ''));
         const body = { ok: !failure, parts_sent, parts_total: plan.total, truncated: plan.truncated,
           result: results.length ? results[0] : null, results };
+        if (job) Object.assign(body, { reply_seq: seq, final, messages_used: job.sentCount || 0,
+          messages_remaining: Math.max(0, cap - (job.sentCount || 0)), ...(!final && !failure ? { next_reply_seq: seq + 1 } : {}) });
         if (hasImg) Object.assign(body, { images_sent: imagesSent.length, images_total: imgs.files.length, images_skipped: imgs.files.length - toSend.length });
         if (failure) { log('reply failed', failure.message, JSON.stringify(failure.body || ''));
           return complete(502, { ...body, ok: false, error: failure.message, detail: failure.body }); }
