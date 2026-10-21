@@ -197,4 +197,5 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | [远程协议](deploy/remote-protocol.md) | 任务、图片、记忆、错误码及恢复语义 |
 | [Sakura FRP 部署示例](deploy/sakura-frp.md) | 通用隧道设置与连通性验证 |
 | [版本与回退](deploy/releases.md) | 发布、升级、备份和回退 |
+| [同类项目代码调研](docs/research/bridge-comparison.md) | 进度反馈、投递语义、角色和记忆设计的对照与实施建议 |
 | [更新记录](CHANGELOG.md) | 各版本变更 |
