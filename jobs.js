@@ -11,6 +11,10 @@ function atomicFile(file, contents) {
     fd = fs.openSync(temp, 'wx', 0o600);
     fs.writeFileSync(fd, contents); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
     fs.renameSync(temp, file);
+    if (process.platform === 'linux') {
+      const parent = fs.openSync(path.dirname(file), 'r');
+      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+    }
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     if (fs.existsSync(temp)) fs.unlinkSync(temp);

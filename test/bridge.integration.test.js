@@ -39,6 +39,7 @@ test('real bridge process recovers a queued webhook after restart and accepts th
     socket.on('message', raw => {
       const message = JSON.parse(raw);
       if (message.op === 1) socket.send(JSON.stringify({ op: 11 }));
+      if (message.op === 6) socket.send(JSON.stringify({ op: 0, t: 'RESUMED', s: message.d.seq, d: {} }));
       if (message.op === 2) {
         socket.send(JSON.stringify({ op: 0, t: 'READY', s: 1, d: { session_id: 'S', user: { username: 'test' } } }));
         socket.send(JSON.stringify({ op: 0, t: 'C2C_MESSAGE_CREATE', s: 2,
