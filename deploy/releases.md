@@ -2,8 +2,8 @@
 
 - `v1.1.0`：已验证的远程文字收发及休眠唤醒基线。
 - `v1.2.0`：持久化转发、回调防重、远程图片与会话记忆接口。
-- 所有变更在 `feat/reliable-remote-bridge` 分支上分次提交；使用带说明的 Git 标签标记版本。
-- `deploy/ci-test.yml` 提供 Node.js 22/24、Windows/Linux 的测试模板。当前 GitHub 登录缺少 workflow 权限，尚未启用 Actions；授权后可将模板放到 `.github/workflows/test.yml` 单独提交。
+- 新变更从最新 `main` 创建独立分支，分次提交后通过 PR 合并；使用带说明的 Git 标签标记功能版本，已发布标签不重写。纯文档更新不修改运行版本。
+- `deploy/ci-test.yml` 提供 Node.js 22/24、Windows/Linux 的测试模板，尚未启用 Actions。需要启用时，将模板放到 `.github/workflows/test.yml` 并使用具有相应权限的账户提交。
 - `.env*`（除示例）、`reply_token`、`data/`、`memory/`、日志不进入版本库。发布前检查暂存区是否含运行密钥。
 
 ## 升级
@@ -23,7 +23,7 @@ systemctl --user start qq-grokbot-bridge
 npm run status
 ```
 
-若服务器无法访问 GitHub，可从 Windows 使用 `git bundle create <文件> --all` 导出包含标签的提交，通过 SSH/SCP 导入服务器。传输包不包含被 Git 忽略的配置和数据。
+若目标主机无法访问 GitHub，可在能访问仓库的机器上使用 `git bundle create <文件> <目标标签>` 导出指定版本，通过 SSH/SCP 传输，再在目标主机导入该标签。传输包不包含被 Git 忽略的配置和数据。
 
 ## 回退
 

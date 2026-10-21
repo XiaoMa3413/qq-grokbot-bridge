@@ -1,10 +1,12 @@
-# 在 DGX Spark 上部署，使用 Sakura FRP 回传回复
+# 使用 Sakura FRP 回传回复
 
 提供远程回复和独立隧道探测；v1.2 已支持持久化队列、回调防重、图片和记忆接口，详见 [远程协议](remote-protocol.md)。不要把探测成功理解为 Grok 休眠唤醒或 QQ 收发已验证。
 
+本页使用通用 Linux 主机和示例路径。首次部署或交给 agent 执行时，参照 [通用部署任务](../DEPLOY_AGENT.md)；域名、端口和目录按目标环境填写。
+
 ## 1. 创建独立隧道
 
-在 Sakura FRP 面板创建并在 **gb10 的启动器**启用这条隧道：
+在 Sakura FRP 面板创建隧道，并在桥接主机上的启动器中启用：
 
 | 字段 | 值 |
 |---|---|
@@ -16,7 +18,7 @@
 | 自动 HTTPS | 自动 |
 | 子域绑定 | 给此隧道申请并绑定免费的 `nyat.app` 子域名 |
 
-现有 `natfrp-service` 容器已检查为 host 网络，因此 `127.0.0.1` 是服务器本机。若日后改为 Docker bridge 网络，必须重新确认这一地址。
+启动器直接运行在主机上或使用 Docker host 网络时，`127.0.0.1` 指向桥接主机。若使用 Docker bridge 网络，必须另行配置能访问桥接服务的地址，不能假定容器回环地址就是主机。
 
 本地服务提供 HTTP，由 frpc 终止外部 TLS。等待启动日志出现“已从服务器为 … 加载证书”，再使用 `https://<绑定子域名>:<远程端口>` 访问，客户端保持证书验证开启。节点须允许该用途，以面板限制为准。不要改动现有 SSH 隧道。
 
@@ -24,10 +26,10 @@
 
 ## 2. 先验证隧道，不连接 QQ
 
-项目路径：`/home/xingjionline/projects/qq-grokbot-bridge`，要求 Node.js 22 或以上。
+以下使用 `$HOME/projects/qq-grokbot-bridge` 作为示例项目目录，请按实际位置调整。npm 脚本要求 Node.js 22.9+，建议使用 22.x/24.x。安装依赖前确认目录中没有正在运行的生产桥接。
 
 ```bash
-cd /home/xingjionline/projects/qq-grokbot-bridge
+cd "$HOME/projects/qq-grokbot-bridge"
 npm ci
 npm run probe
 ```
@@ -42,22 +44,23 @@ npm run probe
 
 鉴权探测用 `POST /probe`，请求头 `X-Reply-Token`，JSON 为 `{"nonce":"自定义随机值"}`。成功会原样回传 nonce 和服务器时间；错误 token 返回 401。该服务没有 `/reply`，不会转发消息或执行命令。
 
-Windows 可在本机临时通过 SSH 读取 token 并完成测试，token 不会输出到终端：
+Windows 可使用已通过安全方式配置到本地执行环境的 `QQ_REPLY_TOKEN` 完成测试；它必须与桥接端有效密钥一致，不会自动读取其他主机的配置：
 
 ```powershell
 $probeBase = 'https://<绑定子域名>:<远程端口>'
-$probeToken = (ssh gb10 'cat /home/xingjionline/projects/qq-grokbot-bridge/reply_token').Trim()
-Invoke-RestMethod "$probeBase/health"
+$probeToken = $env:QQ_REPLY_TOKEN
+if ([string]::IsNullOrWhiteSpace($probeToken)) { throw '请先通过安全方式配置 QQ_REPLY_TOKEN' }
+Invoke-RestMethod "$probeBase/health" -MaximumRedirection 0 -TimeoutSec 15
 $probeNonce = [guid]::NewGuid().ToString()
-Invoke-RestMethod "$probeBase/probe" -Method Post -ContentType 'application/json' -Headers @{ 'X-Reply-Token' = $probeToken } -Body (@{ nonce = $probeNonce } | ConvertTo-Json)
+Invoke-RestMethod "$probeBase/probe" -Method Post -ContentType 'application/json' -Headers @{ 'X-Reply-Token' = $probeToken } -Body (@{ nonce = $probeNonce } | ConvertTo-Json) -MaximumRedirection 0 -TimeoutSec 15
 Remove-Variable probeToken
 ```
 
-服务运行方式若为本次准备的临时 systemd 用户单元，可用 `systemctl --user status qq-bridge-probe` 查看，`systemctl --user stop qq-bridge-probe` 停止。此单元未设置开机启动。
+若自行配置了临时 systemd 探测单元，用其实际单元名查看和停止；前台 `npm run probe` 使用 Ctrl+C 停止。探测服务不应设为长期生产服务。
 
 ## 3. 配置并启动真实桥接
 
-复制 `.env.example` 为 `.env`，权限设为 600，在服务器上填写 QQ 凭据和现有 Grok webhook；配置：
+仅在 `.env` 不存在时复制 `.env.example`，权限设为 600，在服务器上填写 QQ 凭据和现有 Grok webhook；已有配置应保留并合并。配置：
 
 ```dotenv
 QQ_REPLY_PUBLIC_URL=https://<绑定子域名>:<远程端口>/reply
@@ -68,16 +71,16 @@ QQ_REPLY_PUBLIC_URL=https://<绑定子域名>:<远程端口>/reply
 先停止探测服务、停止 Grok 云电脑上旧的桥接进程，再启动新桥接，避免两处同时处理消息：
 
 ```bash
-systemctl --user stop qq-bridge-probe
-cd /home/xingjionline/projects/qq-grokbot-bridge
+# 先停止实际运行的探测服务和旧桥接，确认端口已释放。
+cd "$HOME/projects/qq-grokbot-bridge"
 npm start
 ```
 
-长期运行可安装提供的 systemd 用户服务，先确认服务文件中的项目路径正确：
+长期运行可安装提供的 systemd 用户服务，先按 [部署指南](../DEPLOY_AGENT.md) 核对项目路径和 Node 绝对路径，并停止前台实例。以下仅用于首次安装，不覆盖已有自定义单元：
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/qq-grokbot-bridge.service ~/.config/systemd/user/
+cp -n deploy/qq-grokbot-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now qq-grokbot-bridge
 journalctl --user -u qq-grokbot-bridge -f
@@ -87,7 +90,7 @@ journalctl --user -u qq-grokbot-bridge -f
 
 ## 4. Grok 回传与休眠测试
 
-现有云端配置迁移、例行任务指令草稿和切换顺序见 [Grok 云电脑迁移说明](grok-routine.md)。
+例行任务配置和迁移步骤见 [Grok webhook 任务配置](grok-routine.md)。
 
 通过 Grok 的安全凭据配置渠道，在其执行环境设置 `QQ_REPLY_TOKEN`（与桥接端相同）及固定的 `QQ_REPLY_URL=https://<绑定子域名>:<远程端口>/reply`。不要让用户消息或 webhook 载荷覆盖配置中的回传地址。
 
