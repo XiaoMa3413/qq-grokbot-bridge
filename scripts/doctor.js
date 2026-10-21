@@ -34,7 +34,10 @@ async function diagnose({ dir = path.resolve(__dirname, '..'), env = process.env
   }
   let cfg;
   try { cfg = loadConfig({ dir, env: values }); add('config', 'pass', 'config.json 与公网回复地址可解析。'); }
-  catch { add('config', 'fail', '检查 config.json，以及 QQ_REPLY_PUBLIC_URL 是否为无查询参数、无片段、无凭据的 HTTPS /reply 地址。'); }
+  catch (error) { add('config', 'fail', error.code === 'ECONTEXTBUDGET'
+    ? 'config.json 的 contextTextMaxChars 需为 256–65536 的整数。'
+    : error.code === 'ECONTEXTLIMIT' ? 'config.json 的 historyLimitC2c / historyLimitGroup 需为 1–1000 的整数。'
+    : '检查 config.json，以及 QQ_REPLY_PUBLIC_URL 是否为无查询参数、无片段、无凭据的 HTTPS /reply 地址。'); }
   const mode = cfg ? cfg.replyPublicUrl ? 'remote' : 'local' : null;
   if (cfg) {
     add('webhook', validHttp(cfg.forwardWebhookUrl) && !placeholder(cfg.forwardWebhookUrl) ? 'pass' : 'fail',

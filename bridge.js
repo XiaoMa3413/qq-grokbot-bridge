@@ -5,7 +5,8 @@ const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, HTTP_TI
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
-const { getHistory, append, mergeRecent } = require('./history');
+const { readAll, historyLimit, append, mergeRecent } = require('./history');
+const { assembleContext, speakerId } = require('./context');
 const { memoryPath } = require('./memory');
 const { Watchdog } = require('./watchdog');
 const { checkLiveness, detectClockJump } = require('./liveness');
@@ -92,12 +93,15 @@ function recordInbound(p, content) {
   const id = p.type === 'group' ? p.group_openid : p.openid;
   p.memory_path = memoryPath(p.type, id);
   try {
-    const stored = getHistory(p.type, id);
-    p.history = stored.filter(entry => entry.msg_id !== p.msg_id);
+    const stored = readAll(p.type, id, { strict: true });
+    Object.assign(p, assembleContext(p, stored, { maxChars: cfg.contextTextMaxChars, maxEntries: historyLimit(p.type) }));
     if (!stored.some(entry => entry.msg_id === p.msg_id)) append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
-      openid: (p.author && (p.author.user_openid || p.author.member_openid)) || null, msg_id: p.msg_id,
+      openid: speakerId(p), msg_id: p.msg_id,
       content: content ?? p.content, timestamp: p.timestamp || new Date().toISOString() });
-  } catch (e) { log('history error', e.message); if (!Array.isArray(p.history)) p.history = []; }
+  } catch (e) {
+    log('history error', e.message);
+    Object.assign(p, assembleContext(p, [], { maxChars: cfg.contextTextMaxChars, maxEntries: historyLimit(p.type), historyAvailable: false }));
+  }
 }
 async function forward(p) {
   if (!cfg.forwardWebhookUrl) return;
@@ -129,7 +133,7 @@ async function prepareInbound(p) {
   if (p.type === 'group' && p.at === false) {
     for (const x of imgs) recent.add(p.group_openid, { local_path: x, nickname: p.nickname, timestamp: p.timestamp });
     append('group', p.group_openid, { role: 'user', nickname: p.nickname, member_role: p.author.member_role,
-      openid: p.author.member_openid || null, content: histContent, timestamp: p.timestamp || new Date().toISOString() });
+      openid: speakerId(p), msg_id: p.msg_id, content: histContent, timestamp: p.timestamp || new Date().toISOString() });
     log('recv group-nonat', p.msg_id); return;
   }
   if (p.type === 'group') {

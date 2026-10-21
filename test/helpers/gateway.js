@@ -91,6 +91,7 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
     catch { return {}; }
   }
   return { root, start, stop, health, resumes, heartbeats, deliveries, sends, release, releaseResume,
+    dispatch(message) { for (const socket of sockets) if (socket.readyState === 1) socket.send(JSON.stringify(message)); },
     get identifies() { return identifies; }, get connections() { return connections; } };
 }
 function event(id, sequence, user = 'U') {

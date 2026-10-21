@@ -3,6 +3,11 @@ const fs = require('node:fs'), path = require('node:path'), crypto = require('no
 
 function loadConfig({ dir = __dirname, env = process.env } = {}) {
   const c = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+  if (c.contextTextMaxChars === undefined) c.contextTextMaxChars = 12000;
+  if (!Number.isSafeInteger(c.contextTextMaxChars) || c.contextTextMaxChars < 256 || c.contextTextMaxChars > 65536)
+    throw Object.assign(new Error('contextTextMaxChars must be an integer from 256 to 65536'), { code: 'ECONTEXTBUDGET' });
+  for (const key of ['historyLimitC2c', 'historyLimitGroup']) if (c[key] !== undefined && (!Number.isSafeInteger(c[key]) || c[key] < 1 || c[key] > 1000))
+    throw Object.assign(new Error('history limits must be integers from 1 to 1000'), { code: 'ECONTEXTLIMIT' });
   c.forwardWebhookUrl = env.QQ_FORWARD_WEBHOOK_URL || c.forwardWebhookUrl;
   if (env.QQ_API_BASE) c.apiBase = env.QQ_API_BASE;
   if (env.QQ_TOKEN_URL) c.tokenUrl = env.QQ_TOKEN_URL;
