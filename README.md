@@ -1,251 +1,184 @@
-# Grok Bot ⇄ QQ 官方机器人桥接
+# QQ ⇄ Grok Bot 桥接
 
-一个 Node.js 小程序，把 QQ 官方机器人（API v2）收到的消息转给你的 Grok Bot 智能体。支持本机部署，或常驻 Windows/ARM64 Linux 桥接 + Grok 云电脑分离部署。
+把 QQ 官方机器人的私聊和群内 @ 消息交给 Grok Bot 处理，支持文字、图片、对话历史和会话记忆。
 
-当前版本 **1.2.0**。发布记录见 [CHANGELOG](CHANGELOG.md)，远程接口见 [v1.2 协议](deploy/remote-protocol.md)，升级与回退见 [版本管理](deploy/releases.md)。
+**当前功能版本：v1.2.0。** 推荐把桥接部署在持续在线的 Linux 主机上，Grok 云电脑只在 webhook 任务中处理消息并回传结果。Windows 可用于开发和前台测试，支持 x64/ARM64 Linux 常驻部署，不需要 GPU。
 
-- **入站**：QQ WebSocket 网关 → 本程序 → POST 到 Grok Bot 智能体的 webhook
-- **出站**：智能体 → `POST http://127.0.0.1:8787/reply` → 本程序 → QQ OpenAPI
+## 交给 agent 部署
+
+将 **[DEPLOY_AGENT.md](DEPLOY_AGENT.md)** 交给 Grok Bot、Codex 或其他有终端能力的 agent，提供运行主机、QQ 凭据、Grok webhook 和 HTTPS 回复入口，即可按文档完成安装与验证。支持直接在目标主机执行，也支持通过 SSH 部署。
+
+复制以下指令并替换占位内容；密钥通过安全配置或文件提供，不粘贴进对话：
+
+```text
+请按仓库根目录 DEPLOY_AGENT.md 完成部署，并逐项报告验收结果。
+仓库：https://github.com/XiaoMa3413/qq-grokbot-bridge
+桥接版本：v1.2.0
+目标主机：<当前主机，或可访问的 SSH 地址>
+公网回复地址：https://<域名>:<端口>/reply
+QQ 与 Grok webhook 凭据：<已配置的凭据文件位置或安全凭据配置>
+```
+
+部署默认使用 `$HOME/projects/qq-grokbot-bridge` 和本机端口 `8787`，可按需调整。升级已有实例时，agent 会先检查配置和运行状态。
+
+## 为什么分离部署
+
+Grok 云电脑可能在无活动时暂停，后台脚本也会一起停止，仅使用 `nohup` 或进程守护无法维持 QQ 长连接。桥接放在持续在线的主机后，由该主机维护 QQ 连接，消息通过 Grok 平台 webhook 触发任务。平台的暂停行为见 [Grok Bot 官方支持说明](https://forum.cursor.com/t/grok-bot-computer-freezes-reboots-repeatedly-and-kills-24-7-background-scripts/174272)。
 
 ```mermaid
 flowchart LR
-  QQ[QQ 用户 / 群] -->|私聊 / 群消息| GW[QQ WebSocket 网关]
-  GW --> B[bridge.js]
-  B -->|POST JSON + Bearer| W[Grok Bot 智能体 webhook]
-  W -.-> A[你的 Grok Bot 智能体]
-  A -->|POST /reply + X-Reply-Token| R[reply_server 127.0.0.1:8787]
-  R -->|/v2/users/... /v2/groups/... messages| API[QQ OpenAPI]
-  API --> QQ
+    Q[QQ 用户 / 群] -->|QQ 网关事件| B[常驻主机上的桥接]
+    B -->|官方 webhook| G[Grok Bot 例行任务]
+    G -->|HTTPS 回传 / 图片 / 记忆| T[隧道或反向代理]
+    T -->|本机 HTTP| B
+    B -->|QQ OpenAPI| Q
 ```
 
-## 功能
+桥接主动连接 QQ WebSocket 网关，**QQ 收消息不需要公网回调**。公网 HTTPS 用于 Grok 回传及访问任务资源。Grok 云电脑上只需配置例行任务、固定回传地址和密钥，无需常驻 QQ 桥接进程。
 
-- **私聊（C2C）**：处理 `C2C_MESSAGE_CREATE` 事件。
-- **群聊被 @ 时响应**：处理 `GROUP_AT_MESSAGE_CREATE` 事件，载荷里的 `at` 为 `true`。
-- **群内非 @ 消息（`GROUP_MESSAGE_CREATE`）**：只记录、不打扰。需要在 QQ 群的机器人设置里开启「获取@机器人的最近10条消息」后才会推送；收到后先按 `msg_id` 去重（与被 @ 的消息共用同一张去重表），再下载图片附件、写入该群的对话历史，**不转发**给智能体、**不回复**。其中最近 10 分钟内的图片会进入一个群内缓存（最多 5 张，按时间升序），之后有人 @ 机器人时随 `recent_images` 一起转发。
-- **其他事件**：不认识的事件类型只在日志里记一行类型名，不解析、不转发。
-- **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带该类型会话最近的若干条记录（`history` 字段），不含当前这条；默认私聊最近 20 条、群聊最近 10 条。文件条数超过「上限 + 10」时裁剪回上限（私聊超过 30 条裁到 20 条，群聊超过 20 条裁到 10 条），每条内容最多保留 2000 字符。上限可在 `config.json` 中用 `historyLimitC2c` / `historyLimitGroup` 配置。机器人发出的回复也会写入历史。
-- **会话记忆文件**：每个会话有一个 Markdown 文件，不存在时自动创建。本机模式通过 `memory_path` 访问；远程模式附带记忆快照和带并发保护的读写接口。
-- **图片附件**：`image/*` 附件会下载到本地（单张上限 20 MB，超时 15 秒），成功后在附件上写入 `local_path`（绝对路径），失败则为 `null`。下载失败不影响消息转发。
-- **长回复拆分**：超过 1500 字符的回复按段落（`\n\n`）、换行、硬切的优先级拆成多条。
-- **遵守 QQ 被动回复限制**：同一 `msg_id` 下，私聊最多 4 条、群聊最多 5 条；不带 `msg_id` 的主动消息单次最多 5 条。超出部分会截断，最后一条末尾加上 `…（内容过长，已截断）`。`msg_seq` 自动递增。
-- **断线重连**：支持心跳、Resume 和指数退避重连（上限 60 秒）。access token 到期前自动刷新。本机 webhook 失败最多尝试 3 次；远程模式在消息时限内持久化重试。连接不健康时退出并由守护脚本/systemd 重启。
+## 功能与边界
 
-## 环境要求
-
-- Node.js 22 及以上
-- 依赖：`ws`（运行 `npm install` 安装）
-- 回复脚本 `reply.sh` 需要 `bash` 和 `curl`
-- 一个 QQ 开放平台机器人，以及一个能接收 webhook 的 Grok Bot 智能体
-
-## 环境变量
-
-| 变量 | 必需 | 说明 |
-|---|---|---|
-| `QQ_APP_ID` | 是 | 机器人 AppID |
-| `QQ_APP_SECRET` | 是 | 机器人 AppSecret |
-| `QQ_FORWARD_WEBHOOK_URL` | 建议 | Grok Bot 智能体的 webhook 地址，会覆盖 `config.json` 里的 `forwardWebhookUrl`。不设置时消息只记日志、不转发 |
-| `QQ_FORWARD_WEBHOOK_SECRET` | 否 | 设置后，转发请求带上 `Authorization: Bearer <secret>` |
-| `QQ_FORWARD_WEBHOOK_HEADER` | 否 | 改用其他请求头名传 secret（此时直接传原值，不加 `Bearer`） |
-| `QQ_REPLY_PORT` | 否 | 回复接口端口，默认 8787 |
-| `QQ_API_BASE` / `QQ_TOKEN_URL` | 否 | 覆盖 OpenAPI 地址和取 token 的地址 |
-| `QQ_HISTORY_DIR` / `QQ_MEMORY_DIR` / `QQ_MEDIA_DIR` | 否 | 覆盖数据目录 |
-| `QQ_HTTP_TIMEOUT_MS` | 否 | 出站 HTTP 请求超时（毫秒），默认 15000，见「稳定性、超时与看门狗」 |
-| `QQ_READY_TIMEOUT_MS` | 否 | 看门狗等待 `READY` / `RESUMED` 的超时（毫秒），默认 60000，见「稳定性、超时与看门狗」 |
-| `QQ_DEBUG_RAW_EVENTS` | 否 | 设为 `1` 时，把原始事件追加写入 `logs/raw-events.jsonl`（已脱敏，见「调试」） |
-
-缺少 `QQ_APP_ID` 或 `QQ_APP_SECRET` 时，进程以退出码 78 退出，守护脚本收到后也会停止。
-
-### 部署到常驻主机
-
-桥接可以运行在 Windows 或 ARM64 Linux 上，Grok 通过公网 HTTPS 接口回传文字回复。Windows 开发测试、DGX Spark 常驻部署和 Sakura FRP 隧道配置见 [分离部署指南](deploy/sakura-frp.md)。
-
-- `npm start`：从项目 `.env`（如存在）加载配置，前台运行桥接。
-- `npm run probe`：只启动隧道探测接口，不连接 QQ 或 Grok。
-- `QQ_REPLY_PUBLIC_URL`：完整外部 HTTPS 回复地址，必须以 `/reply` 结尾。设置后启用持久化远程模式，拒绝本地图片路径，回调必须匹配已登记消息。
-- `QQ_REPLY_TOKEN`：可选固定回复密钥，至少 32 字符；不设置时使用自动生成的 `reply_token`。
-- `QQ_REPLY_URL`：跨平台回复客户端 `npm run reply` 的目的地址；通过 stdin 传入回复 JSON，远程地址必须 HTTPS。
-
-远程图片使用鉴权下载和 `images_base64` 回传，记忆通过任务关联的 GET/PUT 接口访问。`QQ_JOBS_DIR` 可更改默认的 `data/jobs` 队列目录，`npm run status` 查看运行状态。webhook 响应丢失仍可能重复触发 Grok；回复发送中断时会保留“不确定”状态，避免自动重发，详见协议文档。
-
-## config.json
-
-```json
-{
-  "forwardWebhookUrl": "",
-  "replyHost": "127.0.0.1",
-  "replyPort": 8787,
-  "apiBase": "https://api.sgroup.qq.com",
-  "tokenUrl": "https://bots.qq.com/app/getAppAccessToken",
-  "intents": 33554432,
-  "historyLimitC2c": 20,
-  "historyLimitGroup": 10
-}
-```
-
-`intents` 为 `1<<25`（GROUP_AND_C2C_EVENT）。`replyHost` 建议保持 `127.0.0.1`，不要对外暴露。
-
-`historyLimitC2c` / `historyLimitGroup`：转发时附带的对话历史条数上限，默认 20 / 10（缺省或非法值时回退到默认值）。历史文件超过「上限 + 10」条时裁剪回上限条。
-
-## QQ 开放平台设置
-
-1. 在 QQ 开放平台创建机器人，拿到 AppID 和 AppSecret。
-2. 启用单聊和群聊能力，确保有 `GROUP_AND_C2C_EVENT`（`1<<25`）事件权限。
-3. 本程序使用 WebSocket 网关，不需要配置公网回调地址。
-4. **沙箱阶段**：机器人上线前，只有加入沙箱配置的 QQ 号和群才能收到、发出消息。在群里 @ 了机器人却没有反应时，先检查这个群是否在沙箱群列表里，再检查成员是否在白名单里。
-5. **群内非 @ 消息**：在群的机器人设置里开启「获取@机器人的最近10条消息」，`GROUP_MESSAGE_CREATE` 才会推送过来。这类消息只记历史、不回复，同样受沙箱限制。
-
-## 启动与停止
-
-```bash
-npm install
-export QQ_APP_ID=... QQ_APP_SECRET=...
-export QQ_FORWARD_WEBHOOK_URL=... QQ_FORWARD_WEBHOOK_SECRET=...
-mkdir -p logs
-./start.sh   # 后台启动守护进程 run_loop.sh，PID 写入 run.pid
-./stop.sh    # 结束整个进程组
-```
-
-- `run_loop.sh` 在 `bridge.js` 崩溃后自动重启，等待时间从 2 秒开始翻倍，最多 60 秒；连续运行超过 60 秒后重置为 2 秒。
-- 日志：`logs/bridge.log`、`logs/supervisor.log`。
-- 健康检查：`GET http://127.0.0.1:8787/health` → `{"ok":true}`
-
-### 调试
-
-```bash
-QQ_DEBUG_RAW_EVENTS=1 ./start.sh
-```
-
-设为 `1` 时，除 `READY` / `RESUMED` 之外的每个网关事件都会以 `{t, d}` 追加写入 `logs/raw-events.jsonl`，用来和 QQ 文档逐字段核对事件结构。写入前会做一次脱敏：任意层级的键名只要匹配 `token` 或 `secret`（不区分大小写），整个字段都会被丢掉。`logs/` 已在 `.gitignore` 中排除，这个文件只留在本地，不要提交。
-
-## 稳定性、超时与看门狗
-
-- **出站 HTTP 超时**：所有对外请求统一超时，默认 15 秒，可用 `QQ_HTTP_TIMEOUT_MS`（毫秒）调整。覆盖取 access token、获取网关地址、OpenAPI 发消息 / 上传文件、webhook 转发，图片附件下载也是同一时限。超时会按 `ETIMEDOUT` 处理，然后重试或重连：
-  - webhook 转发失败最多重试 3 次，间隔 1 秒、2 秒；
-  - OpenAPI 调用抛出的错误会回给调用方（回复接口返回 502），token 获取失败会在下一次用到 token 时、以及每 30 秒的定时刷新里重试；
-  - 取网关地址失败或连接异常时，按指数退避重连（2 秒起翻倍，上限 60 秒）。
-- **WebSocket 握手超时**：握手 15 秒内未完成即视为连接失败，进入上面的重连流程。
-- **看门狗**：进程启动时、以及每次尝试连接时开始计时，两种情况会主动以退出码 1 退出，交给 `run_loop.sh` 按同样的退避策略重新拉起（退出码 78 表示缺少环境变量，守护进程不会重启）：
-  1. 60 秒内没有收到 `READY` 或 `RESUMED`（超时可用 `QQ_READY_TIMEOUT_MS` 调整）；
-  2. 心跳连续 2 个周期没有收到服务端 ACK。
-- **日志同步写入**：日志用同步写标准输出再重定向到 `logs/bridge.log`，被看门狗或异常强制退出时不会丢行，多行之间也不会交错。
-- 独立存活检查：每 15 秒检查一次，ws 不是 OPEN 或距最近一次 READY/RESUMED/心跳 ACK 超过 90 秒（QQ_LIVENESS_MAX_AGE_MS 可调）就退出，由 run_loop.sh 重启。
-- 暂停感知：定时器漂移超过 30 秒（虚拟机暂停/休眠、时钟跳变）时立即退出并重连。
-- GET /health 返回 {ok, ws_state, last_ack_age_ms, reason}，不健康时返回 HTTP 503。
-- run_loop.sh 外部监控：每 30 秒请求 /health，连续 3 次失败，或失败且 bridge.log 10 分钟未更新时，kill -9 node。
-- 所有出站请求走 undici Agent（连接超时 10 秒、响应头/体超时 15 秒），并带 15 秒 AbortSignal。
-
-## Webhook 转发格式
-
-```json
-{
-  "type": "c2c",
-  "openid": "<user_openid>",
-  "author": { "id": "...", "username": "...", "user_openid": "...", "member_openid": "...", "member_role": "...", "union_openid": "..." },
-  "nickname": "<author.username>",
-  "group_card": null,
-  "content": "消息文本（已 trim）",
-  "quoted": [ { "author": "amy", "content": "被引用的内容", "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ] } ],
-  "msg_id": "<QQ 消息 id>",
-  "timestamp": "...",
-  "attachments": [ { "content_type": "image/png", "url": "...", "local_path": "/abs/path/data/media/<msg_id>-0.png" } ],
-  "message_type": 0,
-  "ref_msg_idx": "<message_scene.ext 里的 ref_msg_idx>",
-  "memory_path": "/abs/path/memory/c2c-<openid>.md",
-  "history": [ { "role": "user|bot", "nickname": "...", "member_role": null, "openid": "...", "content": "...", "timestamp": "..." } ]
-}
-```
-
-群消息的 `type` 为 `"group"`，用 `group_openid` 代替 `openid`，另外多两个字段：`at`（是否 @ 了机器人）和 `recent_images`（群里最近的非 @ 图片）。`author` 保留 QQ 事件里的原始字段。QQ v2 事件一般不提供群名片，所以 `group_card` 通常为 `null`。
-
-### 载荷字段
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `at` | bool | 群消息是否 @ 了机器人：`GROUP_AT_MESSAGE_CREATE` 为 `true`，`GROUP_MESSAGE_CREATE` 为 `false`；私聊载荷没有这个字段 |
-| `quoted` | array | 从 `msg_elements` 递归解析出来的引用/聊天记录，每项 `{ author, content, attachments }`；`message_type` 为 103（引用）或 102（聊天记录）的嵌套元素也会一并收进来 |
-| `message_type` | number \| null | 原始事件的 `message_type`，缺失时为 `null` |
-| `ref_msg_idx` | string \| null | 取自 `message_scene.ext` 里的 `ref_msg_idx=...`，没有则为 `null` |
-| `recent_images` | array | 该群最近 10 分钟内「非 @ 消息」里的图片，最多 5 张，按时间升序，每项 `{ local_path, nickname, timestamp }`；出现在被 @ 的群消息载荷上（没有缓存时为 `[]`），私聊载荷没有这个字段 |
-
-## 回复接口
-
-`POST http://127.0.0.1:8787/reply`，请求头 `X-Reply-Token: <reply_token 文件内容>`。
-
-```json
-{ "type": "c2c", "openid": "<openid>", "msg_id": "<被回复的 msg_id，可选>", "content": "回复文本" }
-```
-
-群聊用 `"type": "group"` 和 `"group_openid"`。带上 `msg_id` 就是被动回复；不带则为主动消息，会受 QQ 主动消息配额限制。
-
-### 发送图片
-
-可以在请求里加 `image`（单个本地绝对路径）或 `images`（路径数组），文字 `content` 可选，图文可以同时发：
-
-```json
-{ "type": "group", "group_openid": "<group_openid>", "msg_id": "<msg_id>",
-  "content": "今天的简报", "images": ["/abs/path/briefing.png"] }
-```
-
-```bash
-curl -sS -X POST http://127.0.0.1:8787/reply \
-  -H 'Content-Type: application/json' -H "X-Reply-Token: $(cat reply_token)" \
-  -d '{"type":"c2c","openid":"<openid>","msg_id":"<msg_id>","content":"看图","image":"/abs/path/a.png"}'
-```
-
-- 流程：先调用 `POST /v2/users/{openid}/files` 或 `/v2/groups/{group_openid}/files`（`file_type: 1`，`file_data` 为 base64，`srv_send_msg: false`）拿到 `file_info`，再发 `msg_type: 7` 的消息（`media.file_info`），带同一个 `msg_id` 和递增的 `msg_seq`。
-- 发送顺序：先发文字（按原规则分段），再逐张发图片。每张图片占一条消息配额，与文字共用被动回复上限（私聊 4 条、群聊 5 条 / msg_id；主动消息 5 条）；超出部分不发送，在响应里记为 `images_skipped`。
-- 校验（不通过返回 400，且什么都不发）：必须是绝对路径、文件存在、扩展名为 `.png`/`.jpg`/`.jpeg`、内容确实是 PNG/JPEG、大小不超过 5 MB（QQ 二进制直传上限）。
-- 带图片的请求，响应额外包含 `images_sent`、`images_total`、`images_skipped`；纯文字请求的响应格式不变。
-- 聊天记录里图片记为 `[图片] 文件名`。
-
-响应：
-
-```json
-{ "ok": true, "parts_sent": 1, "parts_total": 1, "truncated": false, "result": { }, "results": [ ] }
-```
-
-| 状态码 | 含义 |
+| 能力 | 行为 |
 |---|---|
-| 401 | token 错误 |
-| 400 | JSON 无效或缺少字段 |
-| 502 | QQ API 报错（带 `error`、`detail`，以及已发送的条数） |
+| 私聊、群内 @ | 转发正文、路由、历史、引用和可用图片给 Grok |
+| 群内非 @ 消息 | 收到事件时只记录历史、缓存最近图片，不触发回复；是否收到取决于 QQ 权限与群设置 |
+| 对话历史与记忆 | 默认附带私聊 20 条、群聊 10 条历史；每个会话独立 Markdown 记忆，远程写入有并发校验 |
+| 图片 | 入站图片提供鉴权下载；远程回图使用 `images_base64`，支持 PNG/JPEG |
+| 持久化队列 | 远程模式先落盘再转发；同会话顺序处理，不同会话最多并行 4 个任务 |
+| 重试与回调防重 | 转发网络错误、408/429/5xx 按时限重试；相同最终回调返回已保存结果，避免重复发 QQ |
+| 运维 | `/health`、任务状态接口、心跳与断线恢复；Linux systemd 提供退出后重启 |
 
-命令行写法：
+每个任务只提交**一次最终回复**，文字按 1500 字符拆分后再发图片。文字和图片共用配额：当前私聊最多 4 条、群聊最多 5 条。回图最多 5 张，解码后总大小不超过 5 MiB。
 
-```bash
-./reply.sh c2c <openid> <msg_id|-> 回复内容
-./reply.sh group <group_openid> <msg_id|-> 回复内容
-IMAGE=/abs/path/a.png ./reply.sh c2c <openid> <msg_id|-> [文字|-]   # 附带一张图片
-```
+回复时限按原 QQ 消息计时：群聊 5 分钟、私聊 60 分钟，排队不会延长时限。Grok 执行慢、等待审批或配额不足仍可能导致到期。webhook 响应丢失可能重复触发 Grok；发送 QQ 时中断会标记 `uncertain`，需核对结果，不自动重发。详细语义见 [远程协议](deploy/remote-protocol.md)。
 
-`reply_token` 在首次启动时随机生成，文件权限为 600。
+## 手动快速开始
 
-## 数据目录
+准备 Git、Node.js **22.9+（推荐 22.x/24.x）**，以及：
 
-| 路径 | 内容 |
-|---|---|
-| `data/history/<type>-<id>.jsonl` | 对话历史 |
-| `data/media/<msg_id>-<n>.<ext>` | 下载的图片 |
-| `data/jobs/<job_id>.json` | 远程任务、转发尝试和回复结果，权限 600 |
-| `memory/<type>-<id>.md` | 会话记忆，由智能体维护 |
-| `logs/` | 运行日志和调试用的原始事件 |
+- QQ 开放平台机器人 AppID、AppSecret 和私聊/群聊事件权限。
+- 一个接收 JSON 的 Grok 官方 webhook 例行任务及其调用凭据。
+- 一个转发到桥接主机 `127.0.0.1:8787` 的 HTTPS 回复入口，可使用反向代理或隧道服务。
 
-以上目录、`reply_token` 和 `run.pid` 都已在 `.gitignore` 中排除。
+项目使用 `ws` 和 `undici`，通过锁文件安装。npm 脚本依赖 `--env-file-if-exists`，该参数始于 Node.js 22.9，见 [Node.js CLI 文档](https://nodejs.org/api/cli.html#--env-file-if-existsfile)。
 
-## 测试
+### 1. 下载与安装
 
 ```bash
+git clone https://github.com/XiaoMa3413/qq-grokbot-bridge.git
+cd qq-grokbot-bridge
+git switch --detach v1.2.0
+npm ci
 npm test
 ```
 
-一条命令跑两套测试：`test/test.js` 会先加载 `test/events.test.js`（事件解析、去重表、最近图片缓存、脱敏），再执行下面的主测试；任一断言失败都会以非 0 退出码结束。
+### 2. 填写配置
 
-测试使用临时目录和本地模拟服务器，覆盖事件转换、token 刷新、回复接口（鉴权、拆分、被动回复上限、截断）、历史记录、记忆路径和图片下载，不需要真实的 QQ 凭据。
+Linux 使用 `cp -n .env.example .env`，Windows PowerShell 使用 `if (!(Test-Path .env)) { Copy-Item .env.example .env }`。编辑 `.env`，填写：
 
-## 安全
+```dotenv
+QQ_APP_ID=<QQ AppID>
+QQ_APP_SECRET=<QQ AppSecret>
+QQ_FORWARD_WEBHOOK_URL=<Grok 官方 webhook 地址>
+QQ_FORWARD_WEBHOOK_SECRET=<webhook 密钥；任务无鉴权时可留空>
+QQ_REPLY_PORT=8787
+QQ_REPLY_PUBLIC_URL=https://<域名>:<端口>/reply
+```
 
-- AppID、AppSecret 和 webhook secret 只通过环境变量传入，不要写进文件或提交到仓库。
-- 回复接口只监听 `127.0.0.1`，并用 `X-Reply-Token` 鉴权。
-- 日志不会输出密钥；取 token 失败时只记录错误码和错误信息。
-- 历史、记忆和图片文件可能包含用户隐私，请妥善保管，并按需清理。
+将占位符替换为平台提供的值。Linux 上设置 `.env` 权限为 `600`。HTTPS 入口的具体配置可参考 [Sakura FRP 示例](deploy/sakura-frp.md)，也可使用其他支持 HTTPS 的隧道或反向代理。
+
+### 3. 配置 Grok 回复
+
+在项目目录初始化回复密钥（命令不显示密钥）：
+
+```bash
+node --env-file=.env -e "require('./lib').loadReplyToken()"
+```
+
+默认密钥保存在项目根目录 `reply_token`；如果 `.env` 已设置 `QQ_REPLY_TOKEN`，使用该固定值。通过安全凭据配置将同一个值提供给 Grok 执行环境，并设置 `QQ_REPLY_URL` 等于桥接的 `QQ_REPLY_PUBLIC_URL`。
+
+将 [Grok 任务规则](DEPLOY_AGENT.md#可复制到-grok-例行任务的规则) 复制到 webhook 例行任务。任务使用固定地址和密钥回传最终回复，支持图文及会话记忆。
+
+### 4. 启动与验证
+
+如果运行了探测服务，先停止它，确保端口空闲。启动桥接：
+
+```bash
+npm start
+```
+
+在另一个终端进入同一项目目录，检查连接：
+
+```bash
+npm run status
+```
+
+`npm start` 从项目 `.env` 加载配置并前台运行。长期部署请按 [agent 部署指南](DEPLOY_AGENT.md) 安装 systemd 用户服务；修改服务模板中的项目目录和 Node 绝对路径，并检查用户 linger。Windows 关闭前台终端后会停止，仓库目前未提供 Windows 开机服务安装器。
+
+状态返回 `ok: true` 后，私聊机器人或在已授权的群内 @机器人发送一条消息，确认 Grok 任务被触发并在 QQ 收到回复。沙箱机器人需先配置测试用户和群。
+
+如果只想让 Grok 与桥接在同一台机器上运行，可以不设置 `QQ_REPLY_PUBLIC_URL`，回传到 `http://127.0.0.1:8787/reply`。这使用本机模式，支持本地图片路径和 `memory_path`，**没有远程模式的持久化任务与回调防重**；主机休眠时连接仍会中断。
+
+## 配置参考
+
+| 变量 | 说明 |
+|---|---|
+| `QQ_APP_ID`、`QQ_APP_SECRET` | 必填，QQ 机器人凭据 |
+| `QQ_FORWARD_WEBHOOK_URL` | Grok webhook；未设置时只记录消息、不转发 |
+| `QQ_FORWARD_WEBHOOK_SECRET` | 默认作为 `Authorization: Bearer ...` 发送 |
+| `QQ_FORWARD_WEBHOOK_HEADER` | 仅原 webhook 使用自定义鉴权头时设置；直接传密钥原值 |
+| `QQ_REPLY_PORT` | 本机端口，默认 `8787` |
+| `QQ_REPLY_PUBLIC_URL` | 完整 HTTPS `/reply` 地址；设置后启用持久化远程模式；禁止查询参数、片段和 URL 内凭据 |
+| `QQ_REPLY_TOKEN` | 可选，至少 32 字符；不设置时读取或生成 `reply_token`。不要设置为空字符串 |
+| `QQ_REPLY_URL` | **回复客户端/Grok 执行环境**的固定目标地址，不是桥接服务器的监听配置 |
+| `QQ_JOBS_DIR` | 远程任务目录，默认 `data/jobs`，禁止多个桥接进程共用 |
+| `QQ_HISTORY_DIR`、`QQ_MEMORY_DIR`、`QQ_MEDIA_DIR` | 覆盖对应数据目录 |
+| `QQ_HTTP_TIMEOUT_MS` | 出站 HTTP 超时，默认 `15000` 毫秒 |
+| `QQ_READY_TIMEOUT_MS`、`QQ_LIVENESS_MAX_AGE_MS` | 启动等待和存活检查时限，默认 `60000` / `90000` 毫秒 |
+| `QQ_DEBUG_RAW_EVENTS` | `1` 时保存调试事件；仍可能包含会话隐私 |
+
+`config.json` 配置监听地址、QQ API、事件 intents 和历史条数。监听地址由 `replyHost` 设置，默认 `127.0.0.1`。不要把真实凭据写入版本库。
+
+QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把测试用户和群加入沙箱名单。项目面向被动回复，远程接口要求已登记消息的原始路由，不将过期任务改为主动推送。
+
+## 常用操作
+
+| 操作 | 命令 / 入口 |
+|---|---|
+| 本地测试 | `npm test`，使用临时目录和模拟 QQ/webhook，不需要真实凭据 |
+| 仅测隧道 | `npm run probe`，不连接 QQ；不能与真实桥接占用同一端口 |
+| 查看健康 | `npm run status`；`GET /health` 不健康时返回 503 |
+| 查看服务日志 | `journalctl --user -u qq-grokbot-bridge -f` |
+| 启动 Linux 服务 | `systemctl --user start qq-grokbot-bridge`，停止或重启使用 `stop` / `restart` |
+| 远程回传 | 使用 HTTP 工具，或配置 `QQ_REPLY_URL` / `QQ_REPLY_TOKEN` 后运行 `npm run reply`，JSON 从 stdin 输入 |
+
+远程 `POST /reply` 的最小请求如下，需 `Content-Type: application/json` 和 `X-Reply-Token` 请求头：
+
+```json
+{
+  "job_id": "<原任务ID>",
+  "type": "c2c",
+  "openid": "<原用户ID>",
+  "msg_id": "<原消息ID>",
+  "content": "最终回复"
+}
+```
+
+群聊使用 `type: "group"` 和 `group_openid`。只有 HTTP 2xx 且 JSON `ok: true` 才算成功；部分发送失败、409 或 410 时不要盲目重试。图片和记忆请求示例见 [远程协议](deploy/remote-protocol.md)。
+
+## 数据、测试与版本
+
+运行数据位于 `data/history/`、`data/media/`、`data/jobs/`、`memory/` 和 `logs/`；systemd 的标准输出由 journal 保存。`.env`、`reply_token` 及运行数据已被 Git 忽略，仍应限制访问并单独备份。任务默认保留至截止时间后 7 天、最多 10,000 项；媒体目前不自动清理。
+
+`npm test` 覆盖事件解析、历史、鉴权、图片、记忆并发、任务恢复、防重及模拟服务集成。首次部署还需通过 QQ 发送实际消息，确认 Grok 任务执行并成功回传；完整验收步骤见 [部署指南](DEPLOY_AGENT.md#7-按阶段验收)。
+
+[CI 模板](deploy/ci-test.yml) 提供 Node.js 22/24、Windows/Linux 矩阵，**当前尚未启用 GitHub Actions**。功能版本使用 Git 标签固定，升级前备份并等待在途任务完成，不直接覆盖运行目录中的配置或数据。
+
+| 文档 | 内容 |
+|---|---|
+| [交给 agent 部署](DEPLOY_AGENT.md) | 完整安装、迁移和验收流程 |
+| [Grok 任务配置](deploy/grok-routine.md) | 凭据迁移及可复制的例行任务规则 |
+| [远程协议](deploy/remote-protocol.md) | 任务、图片、记忆、错误码及恢复语义 |
+| [Sakura FRP 部署示例](deploy/sakura-frp.md) | 通用隧道设置与连通性验证 |
+| [版本与回退](deploy/releases.md) | 发布、升级、备份和回退 |
+| [更新记录](CHANGELOG.md) | 各版本变更 |
