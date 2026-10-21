@@ -11,7 +11,7 @@
 | 参数 | 来源 / 默认值 |
 |---|---|
 | 源码仓库 | `https://github.com/XiaoMa3413/qq-grokbot-bridge.git` |
-| 源码版本 | `v1.2.0`；除非用户指定其他已发布标签，不部署浮动分支 |
+| 源码版本 | 默认 `main`；也可指定已发布标签，部署时记录实际提交 ID |
 | 目标主机 | 当前常驻 Linux 主机，或用户明确指定且本执行环境可达的 SSH 主机 |
 | 安装目录 | 目标用户的 `$HOME/projects/qq-grokbot-bridge`，可使用用户指定的绝对路径 |
 | 本机回复端口 | `8787`，与隧道目标一致 |
@@ -54,14 +54,14 @@ ss -ltn
 
 有未提交代码、在途任务或不同版本时，按第 9 节处理迁移。不要在服务运行时执行 `npm ci`，它会替换依赖目录。
 
-## 2. 获取固定版本并测试
+## 2. 获取源码并测试
 
 以下命令仅用于**目标目录尚不存在的新安装**，在目标用户下执行：
 
 ```bash
 umask 077
 mkdir -p "$HOME/projects"
-git clone --branch v1.2.0 --depth 1 \
+git clone --branch main --depth 1 \
   https://github.com/XiaoMa3413/qq-grokbot-bridge.git \
   "$HOME/projects/qq-grokbot-bridge"
 cd "$HOME/projects/qq-grokbot-bridge"
@@ -71,11 +71,17 @@ npm ci --no-audit --no-fund
 npm test
 ```
 
-用户指定其他路径或版本时，先替换命令中的值。已有目录不得再次克隆覆盖；升级测试在独立目录检出目标标签执行。测试使用模拟服务，不需要生产密钥。任一步失败，处理实际原因后再继续，不能忽略安装或测试失败。
+用户指定其他路径或版本时，先替换命令中的值。部署发布标签时按对应版本的文档操作；下述 setup/doctor 命令适用于当前源码。已有目录不得再次克隆覆盖；升级测试在独立目录检出目标版本执行。测试使用模拟服务，不需要生产密钥。任一步失败，处理实际原因后再继续，不能忽略安装或测试失败。
 
 ## 3. 配置桥接凭据与回复地址
 
-仅 `.env` 不存在时，从 `.env.example` 创建。通过安全文件操作迁移允许的键，不展示内容；不要原样执行未知迁移文件。
+在项目目录运行初始化命令，它创建缺失的 `.env` 和回复密钥，保留已有文件：
+
+```bash
+npm run setup
+```
+
+如果新安装使用已有凭据文件，可改用 `npm run setup -- --from "<凭据文件路径>"`，仅导入下表的字段；已有 `.env` 时跳过导入，避免覆盖。该命令将文件按数据解析，不执行文件内容。为 agent 获取纯 JSON 可使用 `npm run --silent setup -- --json`。
 
 | 键 | 填写方式 |
 |---|---|
@@ -91,33 +97,13 @@ npm test
 
 Linux 将 `.env`、`reply_token`（若存在）设为 `600`，其父目录限制其他用户访问。Windows 使用用户文件 ACL。监听地址由 `config.json` 的 `replyHost` 设置，默认 `127.0.0.1`。
 
-可在项目目录运行以下预检。它加载配置并按需生成 `reply_token`，只输出检查是否通过，不连接 QQ、不打印密钥：
+填写配置后执行本地诊断；失败时修复对应字段，再启动服务：
 
 ```bash
-node --env-file=.env <<'NODE'
-const { loadConfig, loadReplyToken } = require('./lib');
-try {
-  const c = loadConfig();
-  const w = new URL(c.forwardWebhookUrl);
-  const checks = {
-    qq_app_id: Boolean(process.env.QQ_APP_ID?.trim()),
-    qq_app_secret: Boolean(process.env.QQ_APP_SECRET?.trim()),
-    webhook_https: w.protocol === 'https:' && !w.username && !w.password,
-    public_reply_url: Boolean(c.replyPublicUrl),
-    local_only: c.replyHost === '127.0.0.1',
-    port: Number.isInteger(c.replyPort) && c.replyPort > 0 && c.replyPort < 65536,
-    reply_token: loadReplyToken().length >= 32,
-  };
-  console.log(JSON.stringify(checks));
-  if (!Object.values(checks).every(Boolean)) process.exitCode = 1;
-} catch {
-  console.error('配置预检失败；在本机检查必填字段和 URL，不回显其值。');
-  process.exitCode = 1;
-}
-NODE
+npm run --silent doctor -- --remote --json
 ```
 
-检查 shell 现存的 `QQ_*` 变量是否与 `.env` 冲突：Node 环境变量优先于 env 文件；systemd 不继承交互 shell 临时 `export`。不要通过打印整个环境排查。
+结果只包含检查项、状态与处理提示。`FAIL` 返回退出码 1；`WARN` 不阻止通过。默认不联网、不修改文件；它检查配置格式及本地条件，平台凭据与实际回传仍在验收阶段验证。注意 `environment_overrides` 提示：Node 环境变量优先于 env 文件，systemd 不继承交互 shell 临时 `export`。
 
 ## 4. 配置 HTTPS 入口并独立探测
 
@@ -203,6 +189,7 @@ systemctl --user enable --now qq-grokbot-bridge
 systemctl --user is-active qq-grokbot-bridge
 systemctl --user is-enabled qq-grokbot-bridge
 npm run status
+npm run doctor -- --remote --live
 loginctl show-user "$(id -un)" -p Linger
 ```
 
@@ -231,18 +218,19 @@ loginctl show-user "$(id -un)" -p Linger
 当用户明确选择 Windows 测试时，用 PowerShell 和相同版本的 Node，运行：
 
 ```powershell
-git clone --branch v1.2.0 --depth 1 https://github.com/XiaoMa3413/qq-grokbot-bridge.git
+git clone --branch main --depth 1 https://github.com/XiaoMa3413/qq-grokbot-bridge.git
 Set-Location qq-grokbot-bridge
 npm ci
 npm test
-if (!(Test-Path .env)) { Copy-Item .env.example .env }
+npm run setup
 # 安全填写 .env、配置隧道与 Grok；确认没有其他桥接实例后再继续。
+npm run doctor -- --remote
 npm start
 ```
 
 项目已存在时复用目录，不重复克隆覆盖。另一个终端运行 `npm run status`，Ctrl+C 停止前台桥接。Windows 可用 `Get-Content reply.json -Raw | npm run reply` 提交客户端回调。
 
-Linux heredoc、`chmod`、`systemctl` 不适用于 PowerShell；需要预检时把第 3 节 Node 代码写入项目内临时 `.cjs` 文件，再运行 `node --env-file=.env <文件>`，执行后只删除该临时文件。仓库未提供 Windows 开机服务安装器；若用户要求 Windows 无人值守，需使用并验证其服务管理器、用户权限和开机设置，明确报告尚未完成的部分。
+`setup` 和 `doctor` 同时支持 Windows/Linux；`chmod`、`systemctl` 用于 Linux。仓库未提供 Windows 开机服务安装器；若用户要求 Windows 无人值守，需使用并验证其服务管理器、用户权限和开机设置，明确报告尚未完成的部分。
 
 ## 9. 重复执行、升级与回退
 

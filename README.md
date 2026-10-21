@@ -2,7 +2,7 @@
 
 把 QQ 官方机器人的私聊和群内 @ 消息交给 Grok Bot 处理，支持文字、图片、对话历史和会话记忆。
 
-**最新发布版本：v1.2.0。** 推荐把桥接部署在持续在线的 Linux 主机上，Grok 云电脑只在 webhook 任务中处理消息并回传结果。Windows 可用于开发和前台测试，支持 x64/ARM64 Linux 常驻部署，不需要 GPU。
+推荐把桥接部署在持续在线的 Linux 主机上，Grok 云电脑只在 webhook 任务中处理消息并回传结果。Windows 可用于开发和前台测试，支持 x64/ARM64 Linux 常驻部署，不需要 GPU。版本与变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 交给 agent 部署
 
@@ -13,7 +13,7 @@
 ```text
 请按仓库根目录 DEPLOY_AGENT.md 完成部署，并逐项报告验收结果。
 仓库：https://github.com/XiaoMa3413/qq-grokbot-bridge
-桥接版本：v1.2.0
+源码版本：main（也可指定已发布标签）
 目标主机：<当前主机，或可访问的 SSH 地址>
 公网回复地址：https://<域名>:<端口>/reply
 QQ 与 Grok webhook 凭据：<已配置的凭据文件位置或安全凭据配置>
@@ -67,14 +67,20 @@ flowchart LR
 ```bash
 git clone https://github.com/XiaoMa3413/qq-grokbot-bridge.git
 cd qq-grokbot-bridge
-git switch --detach v1.2.0
 npm ci
-npm test
 ```
 
 ### 2. 填写配置
 
-Linux 使用 `cp -n .env.example .env`，Windows PowerShell 使用 `if (!(Test-Path .env)) { Copy-Item .env.example .env }`。编辑 `.env`，填写：
+初始化项目配置和回复密钥，Linux 与 Windows 使用同一命令：
+
+```bash
+npm run setup
+```
+
+命令创建缺失的 `.env` 和 `reply_token`，可重复执行，保留已有配置与密钥。也可在新安装时通过 `npm run setup -- --from .env.import` 从凭据文件导入 QQ/Grok 配置；已有 `.env` 时跳过导入。
+
+编辑 `.env`，填写：
 
 ```dotenv
 QQ_APP_ID=<QQ AppID>
@@ -89,13 +95,13 @@ QQ_REPLY_PUBLIC_URL=https://<域名>:<端口>/reply
 
 ### 3. 配置 Grok 回复
 
-在项目目录初始化回复密钥（命令不显示密钥）：
+完成配置后，先运行本地检查：
 
 ```bash
-node --env-file=.env -e "require('./lib').loadReplyToken()"
+npm run doctor -- --remote
 ```
 
-默认密钥保存在项目根目录 `reply_token`；如果 `.env` 已设置 `QQ_REPLY_TOKEN`，使用该固定值。通过安全凭据配置将同一个值提供给 Grok 执行环境，并设置 `QQ_REPLY_URL` 等于桥接的 `QQ_REPLY_PUBLIC_URL`。
+默认密钥已由 `setup` 保存到项目根目录 `reply_token`；如果 `.env` 已设置 `QQ_REPLY_TOKEN`，使用该固定值。通过安全凭据配置将同一个值提供给 Grok 执行环境，并设置 `QQ_REPLY_URL` 等于桥接的 `QQ_REPLY_PUBLIC_URL`。
 
 将 [Grok 任务规则](DEPLOY_AGENT.md#可复制到-grok-例行任务的规则) 复制到 webhook 例行任务。任务使用固定地址和密钥回传最终回复，支持图文及会话记忆。
 
@@ -111,6 +117,7 @@ npm start
 
 ```bash
 npm run status
+npm run doctor -- --remote --live
 ```
 
 `npm start` 从项目 `.env` 加载配置并前台运行。长期部署请按 [agent 部署指南](DEPLOY_AGENT.md) 安装 systemd 用户服务；修改服务模板中的项目目录和 Node 绝对路径，并检查用户 linger。Windows 关闭前台终端后会停止，仓库目前未提供 Windows 开机服务安装器。
@@ -145,12 +152,18 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 
 | 操作 | 命令 / 入口 |
 |---|---|
+| 初始化配置 | `npm run setup`；新安装可用 `-- --from .env.import` 导入凭据文件 |
+| 启动前诊断 | `npm run doctor -- --remote`；本机模式可省略 `--remote` |
+| 查询运行状态 | `npm run doctor -- --live`，只请求本机 `/health` |
+| agent 诊断 | `npm run --silent doctor -- --remote --json`，返回 JSON 和退出码 |
 | 本地测试 | `npm test`，使用临时目录和模拟 QQ/webhook，不需要真实凭据 |
 | 仅测隧道 | `npm run probe`，不连接 QQ；不能与真实桥接占用同一端口 |
 | 查看健康 | `npm run status`；`GET /health` 不健康时返回 503 |
 | 查看服务日志 | `journalctl --user -u qq-grokbot-bridge -f` |
 | 启动 Linux 服务 | `systemctl --user start qq-grokbot-bridge`，停止或重启使用 `stop` / `restart` |
 | 远程回传 | 使用 HTTP 工具，或配置 `QQ_REPLY_URL` / `QQ_REPLY_TOKEN` 后运行 `npm run reply`，JSON 从 stdin 输入 |
+
+`doctor` 默认只读本地文件，不生成密钥、不连接 QQ 或 Grok。`--live` 额外查询本机健康接口；`--remote` 要求启用远程模式。存在 `FAIL` 时退出码为 1，只有 `PASS` / `WARN` 时为 0。检查通过代表本地配置满足条件，实际凭据有效性和公网连通性仍需通过收发测试验证。初始化和诊断命令适用于当前源码，使用旧标签时按该标签自带的说明部署。
 
 远程 `POST /reply` 的最小请求如下，需 `Content-Type: application/json` 和 `X-Reply-Token` 请求头：
 
