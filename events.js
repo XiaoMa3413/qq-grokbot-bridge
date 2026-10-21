@@ -99,11 +99,15 @@ function parseElements(d) {
 
       const quotable = topLevel || el.message_type === 102 || el.message_type === 103;
       if (quotable) {
-        quoted.push({
+        const quote = {
           author: el.author ? el.author.username || el.author.id || null : null,
           content,
           attachments: atts,
-        });
+        };
+        if (typeof el.msg_id === 'string' && el.msg_id && !el.msg_id.startsWith('TMP_')) quote.msg_id = el.msg_id;
+        const openid = el.author?.member_openid || el.author?.user_openid;
+        if (typeof openid === 'string' && openid) quote.openid = openid;
+        quoted.push(quote);
       }
 
       if (Array.isArray(el.msg_elements)) walk(el.msg_elements, false);

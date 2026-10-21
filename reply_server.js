@@ -1,7 +1,7 @@
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path');
 const { log } = require('./lib');
-const { append } = require('./history');
+const { append, readAll } = require('./history');
 const { decodeImages, replyFingerprint } = require('./remote');
 const { repliesOf } = require('./jobs');
 const MAX_LEN = 1500;                        // QQ message content limit we split at
@@ -155,7 +155,17 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
           } catch (e) { failure = e; break; }
         }
         const histText = [plan.parts.slice(0, parts_sent).join('')].concat(imagesSent.map(n => '[图片] ' + n)).filter(Boolean).join('\n');
+        if (job && (parts_sent || imagesSent.length) && !readAll(j.type, target).some(e => e.role === 'user' && e.msg_id === j.msg_id)) {
+          // A long-running task's question may have aged out while group background messages arrived.
+          const question = job.payload;
+          append(j.type, target, { role: 'user', msg_id: j.msg_id, nickname: question.nickname,
+            openid: question.type === 'c2c' ? question.openid : question.author?.member_openid || question.author?.user_openid,
+            member_role: question.author?.member_role, timestamp: question.timestamp,
+            content: [question.content, ...(question.attachments || []).map(() => '[图片]')].filter(Boolean).join('\n') });
+        }
         if (parts_sent || imagesSent.length) append(j.type, target, { role: 'bot', nickname: null, member_role: null, openid: null,
+          ...(j.msg_id ? { reply_to_msg_id: j.msg_id } : {}),
+          ...(job ? { reply_to_openid: job.payload.type === 'c2c' ? job.payload.openid : job.payload.author?.member_openid || job.payload.author?.user_openid } : {}),
           content: histText, timestamp: new Date().toISOString(), ...(job ? { reply_kind: final ? 'final' : 'progress', job_id: job.id, reply_seq: seq } : {}) });
         log('reply done', j.type, j.msg_id || '(active)', parts_sent + '/' + plan.total + (plan.truncated ? ' truncated' : ''));
         const body = { ok: !failure, parts_sent, parts_total: plan.total, truncated: plan.truncated,

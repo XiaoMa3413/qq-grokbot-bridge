@@ -21,6 +21,12 @@ function normalizeEntry(e) {
     timestamp: x.timestamp == null || x.timestamp === '' ? new Date().toISOString() : String(x.timestamp) };
   if (x.id != null && x.id !== '') out.id = prim(x.id); // optional; only present when the source carries one
   if (x.msg_id != null && x.msg_id !== '') out.msg_id = prim(x.msg_id); // optional; only present when the source carries one
+  for (const key of ['reply_to_msg_id', 'reply_to_openid']) if (typeof x[key] === 'string' && x[key]) out[key] = x[key];
+  if (x.source === 'qq_recent_context') out.source = x.source;
+  const originalLength = Math.max(String(x.content ?? '').length, Number.isSafeInteger(x.original_content_chars) ? x.original_content_chars : 0);
+  if (originalLength > out.content.length || x.content_truncated === true) {
+    out.content_truncated = true; out.original_content_chars = originalLength;
+  }
   if (x.role === 'bot' && ['progress', 'final'].includes(x.reply_kind)) {
     out.reply_kind = x.reply_kind;
     if (typeof x.job_id === 'string') out.job_id = x.job_id;
@@ -29,7 +35,7 @@ function normalizeEntry(e) {
   return out;
 }
 // Per-type entry limits, read from config.json (historyLimitC2c / historyLimitGroup), defaulting to 20 / 10.
-function positive(v, dflt) { const n = +v; return Number.isFinite(n) && n > 0 ? n : dflt; }
+function positive(v, dflt) { const n = +v; return Number.isSafeInteger(n) && n > 0 && n <= 1000 ? n : dflt; }
 function configLimits() {
   try {
     const c = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
@@ -43,9 +49,9 @@ function getHistory(type, id) {
   catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
 }
 // Read every entry in the file (untouched by the per-type limit) for mergeRecent dedup.
-function readAll(type, id) {
+function readAll(type, id, { strict = false } = {}) {
   try { return parseEntries(fs.readFileSync(historyFile(type, id), 'utf8')); }
-  catch (e) { if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
+  catch (e) { if (strict && e.code !== 'ENOENT') throw e; if (e.code !== 'ENOENT') log('history read error', historyFile(type, id), e.message); return []; }
 }
 function append(type, id, entry) {
   try {
@@ -58,6 +64,8 @@ function append(type, id, entry) {
     if (lines.length > trim) {
       const keep = new Set([...lines.filter(x => x.reply_kind !== 'progress').slice(-limit),
         ...lines.filter(x => x.reply_kind === 'progress').slice(-5)]);
+      const questions = new Set([...keep].filter(x => x.role === 'bot').map(x => x.reply_to_msg_id).filter(Boolean));
+      for (const line of lines) if (line.role === 'user' && questions.has(line.msg_id)) keep.add(line);
       fs.writeFileSync(f, lines.filter(x => keep.has(x)).map(x => JSON.stringify(x)).join('\n') + '\n');
     }
     return e;
@@ -81,7 +89,7 @@ function mergeRecent(type, id, items, windowMs = 600000) {
     const lines = [String(item.content == null ? '' : item.content)];
     for (const a of attachments) if (a && a.local_path) lines.push('[图片] ' + a.local_path);
     const entry = {
-      role: 'user', nickname: item.author || null, content: lines.join('\n'),
+      role: 'user', nickname: item.author || null, content: lines.join('\n'), source: 'qq_recent_context',
       timestamp: item.timestamp || new Date().toISOString(), msg_id: item.msg_id || null };
     const tMs = Date.parse(entry.timestamp);
     const dup = readAll(type, id).some(e => {
@@ -96,4 +104,4 @@ function mergeRecent(type, id, items, windowMs = 600000) {
   }
   return added;
 }
-module.exports = { getHistory, append, mergeRecent, historyKey, historyFile, historyDir, normalizeEntry, historyLimit, trimAt, MAX_CONTENT };
+module.exports = { getHistory, readAll, append, mergeRecent, historyKey, historyFile, historyDir, normalizeEntry, historyLimit, trimAt, MAX_CONTENT };

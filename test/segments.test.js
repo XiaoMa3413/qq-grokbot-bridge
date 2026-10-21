@@ -58,7 +58,7 @@ test('progress, restart, final and replay preserve QQ sequences, history and con
   assert.equal((await restarted.post(final)).replayed, true);
   assert.equal((await restarted.post({ reply_seq: 3, content: 'extra' })).status, 409);
   assert.deepEqual(f.calls.map(c => [c.content, c.msg_seq]), [[progress.content, 1], [final.content, 2]]);
-  assert.deepEqual(getHistory('c2c', 'U').map(e => e.content), [final.content]);
+  assert.deepEqual(getHistory('c2c', 'U').map(e => e.content), ['question', final.content]);
   const raw = fs.readFileSync(historyFile('c2c', 'U'), 'utf8'); assert.match(raw, /"reply_kind":"progress"/);
   assert.equal(restored.summary().completed, 1);
   await new ForwardWorker(restored, { send: async () => { forwarded++; return { ok: true }; } }).runOnce();

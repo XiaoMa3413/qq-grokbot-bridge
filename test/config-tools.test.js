@@ -105,6 +105,10 @@ test('doctor validates effective configuration without leaking secrets, and warn
   assert.equal(check(await diagnose({ dir, env: { QQ_REPLY_PUBLIC_URL: '' } }), 'reply_mode').status, 'warn');
   assert.equal(check(await diagnose({ dir, env: { QQ_REPLY_PUBLIC_URL: '' }, requireRemote: true }), 'reply_mode').status, 'fail');
   assert.equal(fs.existsSync(path.join(dir, 'reply_token')), false);
+  const configFile = path.join(dir, 'config.json'), current = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  fs.writeFileSync(configFile, JSON.stringify({ ...current, contextTextMaxChars: -1 }));
+  const invalidBudget = await diagnose({ dir, env: {} });
+  assert.equal(check(invalidBudget, 'config').status, 'fail'); assert.match(check(invalidBudget, 'config').message, /contextTextMaxChars/);
 });
 
 test('doctor identifies missing dependencies and invalid data paths without making changes', async t => {

@@ -66,6 +66,7 @@ class RemoteAccess {
     for (const entry of result.history || []) if (typeof entry.content === 'string')
       entry.content = entry.content.replace(/\[图片\] ([^\r\n]+)/g, (_, file) => '[图片] ' + file.split(/[\\/]/).pop());
     result.job_id = job.id; result.reply_url = this.origin + '/reply';
+    result.bridge_version = require('./package.json').version;
     result.memory_url = `${this.origin}/jobs/${job.id}/memory`;
     result.memory = { content: memory.content, etag: memory.etag };
     result.reply_deadline = new Date(job.deadline).toISOString();
