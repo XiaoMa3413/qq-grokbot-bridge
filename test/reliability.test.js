@@ -5,6 +5,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { JobStore, ForwardWorker, digest } = require('../jobs');
 const { RemoteAccess, decodeImages, replyFingerprint } = require('../remote');
 const { createReplyServer } = require('../reply_server');
+const { GatewaySession } = require('../gateway_session');
 const TOKEN = 'test-reliability-0123456789abcdef0123456789';
 const png = Buffer.from([137,80,78,71,13,10,26,10,1,2,3]);
 function setup(t) {
@@ -204,4 +205,22 @@ test('queue capacity, retention and corrupt-state handling are explicit', t => {
   fs.writeFileSync(file, '{broken');
   assert.throws(() => new JobStore(f.options));
   assert.equal(fs.readFileSync(file, 'utf8'), '{broken');
+});
+
+test('gateway checkpoints preserve sequence zero, reject another app and corrupt data, and do not advance on write failure', t => {
+  const f = setup(t), session = new GatewaySession(f.options.dir, 'APP');
+  session.commit('SESSION', 0);
+  const restored = new GatewaySession(f.options.dir, 'APP');
+  assert.equal(restored.sessionId, 'SESSION'); assert.equal(restored.seq, 0);
+  assert.throws(() => new GatewaySession(f.options.dir, 'OTHER'), /does not match/);
+  fs.unlinkSync(restored.file); fs.mkdirSync(restored.file);
+  assert.throws(() => restored.commit('SESSION', 1));
+  assert.equal(restored.seq, 0);
+  fs.rmdirSync(restored.file);
+  restored.commit(null, null);
+  const cleared = new GatewaySession(f.options.dir, 'APP');
+  assert.equal(cleared.sessionId, null); assert.equal(cleared.seq, null);
+  fs.writeFileSync(restored.file, '{broken');
+  assert.throws(() => new GatewaySession(f.options.dir, 'APP'));
+  assert.equal(fs.readFileSync(restored.file, 'utf8'), '{broken');
 });
