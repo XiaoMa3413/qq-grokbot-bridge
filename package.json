@@ -1,20 +1,22 @@
 {
   "name": "qq-bridge",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "",
   "main": "bridge.js",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.9.0"
   },
   "directories": {
     "test": "test"
   },
   "scripts": {
+    "setup": "node scripts/setup.js",
+    "doctor": "node scripts/doctor.js",
     "start": "node --env-file-if-exists=.env bridge.js",
     "probe": "node --env-file-if-exists=.env scripts/tunnel-probe.js",
     "reply": "node --env-file-if-exists=.env scripts/reply.js",
     "status": "node --env-file-if-exists=.env scripts/status.js",
-    "test": "node test/test.js && node --test test/remote.test.js test/reliability.test.js test/bridge.integration.test.js test/ingress.integration.test.js"
+    "test": "node test/test.js && node --test test/remote.test.js test/reliability.test.js test/bridge.integration.test.js test/ingress.integration.test.js test/config-tools.test.js"
   },
   "keywords": [],
   "author": "",

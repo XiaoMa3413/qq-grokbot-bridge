@@ -60,13 +60,15 @@ Remove-Variable probeToken
 
 ## 3. 配置并启动真实桥接
 
-仅在 `.env` 不存在时复制 `.env.example`，权限设为 600，在服务器上填写 QQ 凭据和现有 Grok webhook；已有配置应保留并合并。配置：
+在项目目录运行 `npm run setup` 初始化缺失配置和回复密钥，再填写 QQ 凭据及 Grok webhook。已有配置会保留；Linux 配置文件权限应为 600。配置：
 
 ```dotenv
 QQ_REPLY_PUBLIC_URL=https://<绑定子域名>:<远程端口>/reply
 ```
 
 此变量会启用持久化远程模式：拒绝 `image` / `images`（禁止远程请求读取服务器本地图片），并要求原始消息路由。转发给 Grok 的 JSON 包含 `job_id`、`reply_url`、`reply_deadline`、图片下载地址和记忆快照；不会附带回复 token，也不会暴露 `local_path` / `memory_path`。
+
+启动前运行 `npm run doctor -- --remote` 检查本地配置；服务启动后可用 `npm run doctor -- --remote --live` 查询健康状态。公网 TLS 和回传仍按本页步骤从外部验证。
 
 先停止探测服务、停止 Grok 云电脑上旧的桥接进程，再启动新桥接，避免两处同时处理消息：
 

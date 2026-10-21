@@ -1,7 +1,8 @@
 'use strict';
-const fs = require('fs'), path = require('path'), crypto = require('crypto'), util = require('util');
+const fs = require('fs'), util = require('util');
 const { Agent, fetch } = require('undici');
 const { parseElements, refMsgIdx, parseRecentContext } = require('./events');
+const { loadConfig, loadReplyToken } = require('./configuration');
 const DIR = __dirname;
 // One shared agent for every outbound fetch, so sockets are reused and connect/header/body
 // timeouts are enforced by the agent rather than by the caller.
@@ -10,21 +11,6 @@ const dispatcher = new Agent({
   headersTimeout: 15000,
   bodyTimeout: 15000,
 });
-function loadConfig() {
-  const c = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
-  c.forwardWebhookUrl = process.env.QQ_FORWARD_WEBHOOK_URL || c.forwardWebhookUrl;
-  if (process.env.QQ_API_BASE) c.apiBase = process.env.QQ_API_BASE;
-  if (process.env.QQ_TOKEN_URL) c.tokenUrl = process.env.QQ_TOKEN_URL;
-  if (process.env.QQ_REPLY_PORT) c.replyPort = +process.env.QQ_REPLY_PORT;
-  c.replyPublicUrl = process.env.QQ_REPLY_PUBLIC_URL || '';
-  if (c.replyPublicUrl) {
-    const u = new URL(c.replyPublicUrl);
-    if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash || u.pathname !== '/reply')
-      throw new Error('QQ_REPLY_PUBLIC_URL must be an HTTPS URL ending in /reply without credentials, query or fragment');
-    c.replyPublicUrl = u.href;
-  }
-  return c;
-}
 // Network timeout for every outbound fetch (token, QQ API, forward webhook).
 const HTTP_TIMEOUT_MS = Number(process.env.QQ_HTTP_TIMEOUT_MS) || 15000;
 // fetch() that reports its abort as an ETIMEDOUT error so callers/retries treat it as a timeout.
@@ -53,16 +39,6 @@ function toPayload(t, d) {
   if (t === 'GROUP_AT_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: true, ...base };
   if (t === 'GROUP_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: false, ...base };
   return null;
-}
-function loadReplyToken() {
-  if (process.env.QQ_REPLY_TOKEN !== undefined) {
-    const token = process.env.QQ_REPLY_TOKEN.trim();
-    if (token.length < 32) throw new Error('QQ_REPLY_TOKEN must contain at least 32 characters');
-    return token;
-  }
-  const f = path.join(DIR, 'reply_token');
-  if (!fs.existsSync(f)) fs.writeFileSync(f, crypto.randomBytes(24).toString('hex') + '\n', { mode: 0o600 });
-  return fs.readFileSync(f, 'utf8').trim();
 }
 class TokenManager {
   constructor(cfg, appId, secret) { this.cfg = cfg; this.appId = appId; this.secret = secret; this.token = null; this.exp = 0; this.p = null; }
