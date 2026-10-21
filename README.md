@@ -31,7 +31,7 @@ flowchart LR
 
 ## 环境要求
 
-- Node.js 18 及以上（使用内置 `fetch`）
+- Node.js 22 及以上
 - 依赖：`ws`（运行 `npm install` 安装）
 - 回复脚本 `reply.sh` 需要 `bash` 和 `curl`
 - 一个 QQ 开放平台机器人，以及一个能接收 webhook 的 Grok Bot 智能体
@@ -53,6 +53,18 @@ flowchart LR
 | `QQ_DEBUG_RAW_EVENTS` | 否 | 设为 `1` 时，把原始事件追加写入 `logs/raw-events.jsonl`（已脱敏，见「调试」） |
 
 缺少 `QQ_APP_ID` 或 `QQ_APP_SECRET` 时，进程以退出码 78 退出，守护脚本收到后也会停止。
+
+### 部署到常驻主机
+
+桥接可以运行在 Windows 或 ARM64 Linux 上，Grok 通过公网 HTTPS 接口回传文字回复。Windows 开发测试、DGX Spark 常驻部署和 Sakura FRP 隧道配置见 [分离部署指南](deploy/sakura-frp.md)。
+
+- `npm start`：从项目 `.env`（如存在）加载配置，前台运行桥接。
+- `npm run probe`：只启动隧道探测接口，不连接 QQ 或 Grok。
+- `QQ_REPLY_PUBLIC_URL`：完整外部 HTTPS 回复地址，必须以 `/reply` 结尾。设置后启用远程文字模式，拒绝本地图片路径并要求 `msg_id`。
+- `QQ_REPLY_TOKEN`：可选固定回复密钥，至少 32 字符；不设置时使用自动生成的 `reply_token`。
+- `QQ_REPLY_URL`：跨平台回复客户端 `npm run reply` 的目的地址；通过 stdin 传入回复 JSON，远程地址必须 HTTPS。
+
+Grok 云电脑里的图片和记忆文件跨机访问，以及任务持久化、完成确认和幂等处理仍需后续适配。
 
 ## config.json
 
@@ -221,7 +233,7 @@ IMAGE=/abs/path/a.png ./reply.sh c2c <openid> <msg_id|-> [文字|-]   # 附带�
 ## 测试
 
 ```bash
-node test/test.js
+npm test
 ```
 
 一条命令跑两套测试：`test/test.js` 会先加载 `test/events.test.js`（事件解析、去重表、最近图片缓存、脱敏），再执行下面的主测试；任一断言失败都会以非 0 退出码结束。

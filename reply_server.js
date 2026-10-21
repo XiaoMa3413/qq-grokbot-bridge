@@ -58,8 +58,8 @@ function loadImages(j) {
   }
   return { files };
 }
-function createReplyServer(api, token, getHealth) {
-  return http.createServer((req, res) => {
+function createReplyServer(api, token, getHealth, { remote = false } = {}) {
+  return http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     const send = (c, o) => { res.writeHead(c, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
     if (req.method === 'GET' && req.url === '/health') {
       const h = getHealth ? getHealth() : { ok: true };
@@ -67,12 +67,24 @@ function createReplyServer(api, token, getHealth) {
     }
     if (req.method !== 'POST' || req.url !== '/reply') return send(404, { ok: false, error: 'not found' });
     if (req.headers['x-reply-token'] !== token) return send(401, { ok: false, error: 'bad token' });
-    let b = ''; req.on('data', c => { b += c; if (b.length > 1e6) req.destroy(); });
+    let chunks = [], size = 0, tooLarge = false;
+    req.on('data', c => {
+      if (tooLarge) return;
+      size += c.length;
+      if (size > 1e6) { tooLarge = true; chunks = []; send(413, { ok: false, error: 'body too large' }); return; }
+      chunks.push(c);
+    });
     req.on('end', async () => {
-      let j; try { j = JSON.parse(b); } catch { return send(400, { ok: false, error: 'invalid json' }); }
+      if (tooLarge) return;
+      let j; try { j = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(400, { ok: false, error: 'invalid json' }); }
+      if (!j || typeof j !== 'object' || Array.isArray(j)) return send(400, { ok: false, error: 'need a JSON object' });
       const target = j.type === 'c2c' ? j.openid : j.type === 'group' ? j.group_openid : null;
       const hasText = typeof j.content === 'string' && j.content.length > 0;
       const hasImg = j.image !== undefined || j.images !== undefined;
+      if (remote && hasImg) return send(400, { ok: false, error: 'remote replies currently support text only; server file paths are not accepted' });
+      if (remote && (typeof j.msg_id !== 'string' || !j.msg_id.trim()))
+        return send(400, { ok: false, error: 'remote replies require the original msg_id' });
+      if (typeof target !== 'string') return send(400, { ok: false, error: 'target must be a string' });
       if (!target || (!hasText && !hasImg) || (j.content !== undefined && typeof j.content !== 'string'))
         return send(400, { ok: false, error: 'need type(c2c|group), openid|group_openid, content and/or image(s)' });
       const imgs = loadImages(j);

@@ -1,0 +1,18 @@
+[Unit]
+Description=QQ to Grok Bot bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User service: edit this path if the checkout is elsewhere.
+WorkingDirectory=%h/projects/qq-grokbot-bridge
+ExecStart=/usr/bin/node --env-file=.env bridge.js
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -41,7 +41,7 @@ setInterval(() => {
 const cfg = loadConfig();
 if (!cfg.forwardWebhookUrl) log('WARN: no forward webhook URL (QQ_FORWARD_WEBHOOK_URL / config.json); messages will only be logged');
 const tm = new TokenManager(cfg, APP_ID, SECRET), api = new QQApi(cfg, tm);
-const srv = createReplyServer(api, loadReplyToken(), livenessHealth);
+const srv = createReplyServer(api, loadReplyToken(), livenessHealth, { remote: !!cfg.replyPublicUrl });
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
 
@@ -65,6 +65,7 @@ function recordInbound(p, content) {
 }
 async function forward(p) {
   if (!cfg.forwardWebhookUrl) return;
+  if (cfg.replyPublicUrl) p.reply_url = cfg.replyPublicUrl;
   const h = { 'Content-Type': 'application/json' };
   if (process.env.QQ_FORWARD_WEBHOOK_SECRET) { const hn = process.env.QQ_FORWARD_WEBHOOK_HEADER || 'Authorization'; h[hn] = hn.toLowerCase() === 'authorization' ? 'Bearer ' + process.env.QQ_FORWARD_WEBHOOK_SECRET : process.env.QQ_FORWARD_WEBHOOK_SECRET; }
   for (let i = 0; i < 3; i++) {
