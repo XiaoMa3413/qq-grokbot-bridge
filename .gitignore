@@ -3,6 +3,10 @@ logs/
 reply_token
 run.pid
 .env
+.env.*
+!.env.example
+*.bundle
+*.tar
 data/
 memory/*
 !memory/.gitkeep

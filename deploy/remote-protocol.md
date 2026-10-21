@@ -1,0 +1,77 @@
+# v1.2 远程协议与恢复行为
+
+所有 `/reply`、`/jobs/...` 请求都需要 `X-Reply-Token`；公网只使用 HTTPS，不跟随重定向、不关闭证书校验。密钥不放在 URL 或 webhook 载荷中。`GET /health` 无需鉴权，只暴露版本、连接健康及任务计数，不含聊天内容。
+
+## 持久化与任务顺序
+
+设置 `QQ_REPLY_PUBLIC_URL` 后启用持久化任务。QQ 消息先写入 `data/jobs/<job_id>.json`，再下载附件、附加历史和记忆并转发。重复网关事件使用同一任务；同会话按接收顺序等待上一任务完成，不同会话最多同时转发 4 个任务。
+
+HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒，并遵守 `Retry-After`；其他 HTTP 错误终止该任务。webhook 返回 2xx 后，只等待回传，不因回复慢而重新触发 Grok。若平台已接收请求但网络响应丢失，仍可能重复触发 Grok，不能保证平台只执行一次；回传防重用于避免同一任务重复发 QQ。
+
+转发和回复受 QQ 消息原始时间限制：群聊 5 分钟、单聊 60 分钟。排队不会延长时限；到期返回 410，不改成主动推送。规则依据：[腾讯消息接口](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md)。
+
+任务默认保留至回复截止时间后 7 天，最多 10,000 项；满额明确报错。运行数据可能包含会话内容，应由主机文件权限保护并备份。`QQ_JOBS_DIR` 可更改存储目录；一个目录只允许一个桥接进程使用。历史按原有条数保留，媒体目录目前不自动清理，请根据磁盘容量管理。
+
+## webhook 新字段
+
+```json
+{
+  "job_id": "<64位十六进制ID>",
+  "reply_url": "https://<域名>:<端口>/reply",
+  "reply_deadline": "2026-10-21T10:00:00.000Z",
+  "memory_url": "https://<域名>:<端口>/jobs/<job_id>/memory",
+  "memory": { "content": "该会话当前记忆", "etag": "\"<内容哈希>\"" },
+  "attachments": [
+    { "content_type": "image/png", "download_url": "https://<域名>:<端口>/jobs/<job_id>/media/<asset_id>" }
+  ]
+}
+```
+
+原有 `type`、目标 ID、`msg_id`、`content`、`history` 保留。远程载荷移除 `local_path`、`memory_path`；引用、最近上下文、群图片缓存中已成功下载的图片也会附加 `download_url`。原始 QQ 附件 URL 保留作兼容；需要本地缓存时优先使用鉴权下载地址。下载 URL 不含密钥，需在请求头提供密钥。
+
+## 一次最终回复与防重
+
+每个任务接收一次最终回复，可自动拆成多条 QQ 消息并携带多张图片。不要先发“正在处理”再用同一任务发最终结果。
+
+```json
+{
+  "job_id": "<原任务ID，建议携带>",
+  "type": "group",
+  "group_openid": "<原群ID>",
+  "msg_id": "<原消息ID>",
+  "content": "最终回复"
+}
+```
+
+旧版 Grok 的纯文字回调可不带 `job_id`，服务器会按原 `type`、目标 ID、`msg_id` 查找已登记任务；不能更改收件人。相同内容的重复回调返回保存的结果和 `replayed:true`，不再次发 QQ。不同内容返回 409；未知任务/路由返回 404；到期返回 410。
+
+服务器在发送 QQ 前保存意图。进程在发送过程中中断时，重启后该任务标为 `uncertain`，返回 409 并提示不要重发。无法单靠桥接判断 QQ 是否已经接受消息，因此不宣称跨平台“恰好发送一次”。部分发送失败的结果也会保存；重复请求返回原失败结果，不重新发送已完成的部分。
+
+## 发图片
+
+`POST /reply` 可携带 `images_base64`，`content` 可选：
+
+```json
+{
+  "type": "c2c", "openid": "<原用户ID>", "msg_id": "<原消息ID>",
+  "content": "图片说明",
+  "images_base64": [{ "name": "result.png", "data": "<纯base64，不含data:前缀>" }]
+}
+```
+
+只接受 PNG/JPEG 文件头和对应扩展名，文件名使用 ASCII 字母、数字、下划线、点和连字符。每次最多 5 张、解码后的总大小不超过 5 MiB，请求体上限 8 MiB。文字先发，图片后发，共用单聊 4 条（当前保守上限）/群聊 5 条的配额；响应包含发送及跳过数量。远程 `image`、`images` 本地路径仍被拒绝，不提供服务器任意文件读取或远程 URL 拉取接口。
+
+## 读写记忆
+
+- `GET /jobs/<job_id>/memory` → `{ok, content, etag}`，响应头也包含 `ETag`。
+- `PUT /jobs/<job_id>/memory`，正文 `{ "content": "完整的新Markdown内容" }`，请求头 `If-Match` 填最近读取的 etag。
+- 缺少 `If-Match` 返回 428；已有并发修改返回 412，需要重新读取、合并后再更新。
+- 内容最多 64 KiB，不能指定文件路径；只能操作该任务对应会话的记忆。
+
+记忆和媒体访问随任务到期失效。媒体必须来自该任务已登记且位于媒体目录中的缓存文件，目录穿越和越界符号链接不被接受。需要保存结果时，在任务时限内下载到 Grok 云电脑。
+
+## 状态与日志
+
+`GET /jobs/<job_id>` 返回转发状态、尝试次数、回复状态、错误摘要和截止时间。`npm run status` 在桥接主机查看健康及队列计数；`journalctl --user -u qq-grokbot-bridge -f` 查看日志。`reply HTTP 401/400/409/...` 可区分鉴权、协议和防重问题；日志不打印回复密钥或正文。
+
+程序收到 SIGTERM/SIGINT 后停止接收新请求及重连，等待正在执行的回调/转发完成，最多 30 秒。超时退出后的发送状态按上述 `uncertain` 规则处理。

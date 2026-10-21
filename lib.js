@@ -16,6 +16,13 @@ function loadConfig() {
   if (process.env.QQ_API_BASE) c.apiBase = process.env.QQ_API_BASE;
   if (process.env.QQ_TOKEN_URL) c.tokenUrl = process.env.QQ_TOKEN_URL;
   if (process.env.QQ_REPLY_PORT) c.replyPort = +process.env.QQ_REPLY_PORT;
+  c.replyPublicUrl = process.env.QQ_REPLY_PUBLIC_URL || '';
+  if (c.replyPublicUrl) {
+    const u = new URL(c.replyPublicUrl);
+    if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash || u.pathname !== '/reply')
+      throw new Error('QQ_REPLY_PUBLIC_URL must be an HTTPS URL ending in /reply without credentials, query or fragment');
+    c.replyPublicUrl = u.href;
+  }
   return c;
 }
 // Network timeout for every outbound fetch (token, QQ API, forward webhook).
@@ -48,6 +55,11 @@ function toPayload(t, d) {
   return null;
 }
 function loadReplyToken() {
+  if (process.env.QQ_REPLY_TOKEN !== undefined) {
+    const token = process.env.QQ_REPLY_TOKEN.trim();
+    if (token.length < 32) throw new Error('QQ_REPLY_TOKEN must contain at least 32 characters');
+    return token;
+  }
   const f = path.join(DIR, 'reply_token');
   if (!fs.existsSync(f)) fs.writeFileSync(f, crypto.randomBytes(24).toString('hex') + '\n', { mode: 0o600 });
   return fs.readFileSync(f, 'utf8').trim();
