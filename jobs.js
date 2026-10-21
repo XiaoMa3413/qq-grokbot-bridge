@@ -3,6 +3,8 @@ const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const targetOf = p => p.type === 'group' ? p.group_openid : p.openid;
 const idOf = p => digest(JSON.stringify([p.type, targetOf(p), p.msg_id]));
+const repliesOf = job => job.replies || (job.reply ? [job.reply] : []);
+const replyClosed = job => job.reply?.state === 'done' && (job.reply.final !== false || !job.reply.body?.ok);
 function atomicFile(file, contents) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = file + '.' + crypto.randomUUID() + '.tmp';
@@ -31,6 +33,7 @@ class JobStore {
       if (job.id + '.json' !== name || idOf(job.payload) !== job.id || job.schema !== 1 || !Number.isSafeInteger(job.order))
         throw new Error('invalid persisted job: ' + name);
       this.order = Math.max(this.order, job.order);
+      if (job.replies?.length) job.reply = job.replies.at(-1);
       this.jobs.set(job.id, job);
       if (job.delivery === 'dispatching') { job.delivery = 'pending'; job.nextAttemptAt = now(); this.save(job); }
       if (job.reply?.state === 'sending') { job.reply.state = 'uncertain'; this.save(job); }
@@ -65,29 +68,41 @@ class JobStore {
     return job;
   }
   // Persist the intent before any QQ side effect. An interrupted send is never blindly repeated.
-  beginReply(job, fingerprint) {
-    if (job.reply) {
-      if (job.reply.fingerprint !== fingerprint) return { status: 409, body: { ok: false, error: 'job already has a different reply' } };
-      if (job.reply.state === 'done') return { status: job.reply.httpStatus, body: { ...job.reply.body, replayed: true } };
-      return { status: 409, body: { ok: false, error: job.reply.state === 'uncertain' ? 'reply outcome unknown after restart; do not resend' : 'reply already in progress' } };
+  beginReply(job, fingerprint, { seq = 1, final = true } = {}) {
+    if (!Number.isInteger(seq) || seq < 1 || seq > 5 || typeof final !== 'boolean')
+      return { status: 400, body: { ok: false, error: 'invalid reply sequence or final flag' } };
+    const records = repliesOf(job), existing = records[seq - 1];
+    if (existing) {
+      if (existing.fingerprint !== fingerprint || (existing.final !== false) !== final)
+        return { status: 409, body: { ok: false, error: 'reply_seq already has a different reply' } };
+      if (existing.state === 'done') return { status: existing.httpStatus, body: { ...existing.body, replayed: true } };
+      return { status: 409, body: { ok: false, error: existing.state === 'uncertain' ? 'reply outcome unknown after restart; do not resend' : 'reply already in progress' } };
     }
+    if (job.reply?.state === 'uncertain' || job.reply?.state === 'sending')
+      return { status: 409, body: { ok: false, error: 'previous reply is sending or uncertain; do not send another segment' } };
+    if (replyClosed(job)) return { status: 409, body: { ok: false, error: 'job reply is already closed' } };
+    if (seq !== records.length + 1) return { status: 409, body: { ok: false, error: 'reply_seq must be consecutive', next_reply_seq: records.length + 1 } };
     if (this.now() >= job.deadline) return { status: 410, body: { ok: false, error: 'QQ reply window expired' } };
-    job.reply = { state: 'sending', fingerprint, startedAt: this.now() }; this.save(job);
+    const reply = { state: 'sending', fingerprint, startedAt: this.now(), seq, final };
+    // Publish in-memory state only after the intent is durable.
+    const next = { ...job, replies: [...records, reply], reply };
+    this.save(next); Object.assign(job, next);
     return null;
   }
   finishReply(job, httpStatus, body) {
-    job.reply = { ...job.reply, state: 'done', completedAt: this.now(), httpStatus, body };
-    this.save(job);
+    const reply = { ...job.reply, state: 'done', completedAt: this.now(), httpStatus, body };
+    const next = { ...job, replies: [...repliesOf(job).slice(0, -1), reply], reply };
+    this.save(next); Object.assign(job, next);
   }
   summary() {
     const summary = { pending: 0, awaiting_reply: 0, replying: 0, completed: 0, failed: 0, expired: 0, uncertain: 0 };
     for (const job of this.jobs.values()) {
       if (job.reply?.state === 'uncertain') summary.uncertain++;
       else if (job.reply?.state === 'sending') summary.replying++;
-      else if (job.reply?.state === 'done') summary[job.reply.body.ok ? 'completed' : 'failed']++;
+      else if (replyClosed(job)) summary[job.reply.body.ok ? 'completed' : 'failed']++;
       else if (this.now() >= job.deadline || job.delivery === 'expired') summary.expired++;
       else if (job.delivery === 'failed') summary.failed++;
-      else if (job.delivery === 'accepted') summary.awaiting_reply++;
+      else if (job.delivery === 'accepted' || job.reply) summary.awaiting_reply++;
       else summary.pending++;
     }
     return summary;
@@ -106,7 +121,7 @@ class ForwardWorker {
   async run() {
     const blocked = new Set(), eligible = [];
     for (const job of [...this.store.jobs.values()].sort((a, b) => a.order - b.order)) {
-      if (job.reply?.state === 'done' || job.delivery === 'failed' || job.delivery === 'expired') continue;
+      if (replyClosed(job) || job.delivery === 'failed' || job.delivery === 'expired') continue;
       if (this.store.now() >= job.deadline) { job.delivery = 'expired'; this.store.save(job); this.log('job expired', job.id); continue; }
       const conversation = JSON.stringify([job.payload.type, targetOf(job.payload)]);
       if (blocked.has(conversation)) continue;
@@ -142,4 +157,4 @@ class ForwardWorker {
     return this.store.now() + Math.max(Math.min(60000, 1000 * 2 ** Math.min(job.attempts, 10)), Math.max(0, retryAfterMs || 0));
   }
 }
-module.exports = { JobStore, ForwardWorker, atomicWrite, atomicFile, digest, idOf, targetOf };
+module.exports = { JobStore, ForwardWorker, atomicWrite, atomicFile, digest, idOf, targetOf, repliesOf, replyClosed };

@@ -10,3 +10,4 @@ run.pid
 data/
 memory/*
 !memory/.gitkeep
+/HANDOFF.local.md

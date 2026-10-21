@@ -1,4 +1,4 @@
-# v1.2 远程协议与恢复行为
+# 远程协议与恢复行为
 
 所有 `/reply`、`/jobs/...` 请求都需要 `X-Reply-Token`；公网只使用 HTTPS，不跟随重定向、不关闭证书校验。密钥不放在 URL 或 webhook 载荷中。`GET /health` 无需鉴权，只暴露版本、连接健康及任务计数，不含聊天内容。
 
@@ -27,6 +27,7 @@ HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒�
   "job_id": "<64位十六进制ID>",
   "reply_url": "https://<域名>:<端口>/reply",
   "reply_deadline": "2026-10-21T10:00:00.000Z",
+  "reply_policy": { "segmented": true, "next_reply_seq": 1, "message_limit": 4, "progress_max_chars": 1500, "reserve_final": 1 },
   "memory_url": "https://<域名>:<端口>/jobs/<job_id>/memory",
   "memory": { "content": "该会话当前记忆", "etag": "\"<内容哈希>\"" },
   "attachments": [
@@ -37,9 +38,37 @@ HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒�
 
 原有 `type`、目标 ID、`msg_id`、`content`、`history` 保留。远程载荷移除 `local_path`、`memory_path`；引用、最近上下文、群图片缓存中已成功下载的图片也会附加 `download_url`。原始 QQ 附件 URL 保留作兼容；需要本地缓存时优先使用鉴权下载地址。下载 URL 不含密钥，需在请求头提供密钥。
 
-## 一次最终回复与防重
+## 分段回复与防重（v1.4）
 
-每个任务接收一次最终回复，可自动拆成多条 QQ 消息并携带多张图片。不要先发“正在处理”再用同一任务发最终结果。
+每个任务可以先回传进度，再提交一次最终回复。Grok 在开始耗时操作前主动 POST 第一段，确认成功后继续处理，不必等工作全部完成。桥接不自动代发确认；云电脑尚未唤醒时无法提前获得 Grok 的进度回传。
+
+第一段（保留本次原始路由）：
+
+```json
+{
+  "job_id": "<原任务ID>", "type": "c2c", "openid": "<原用户ID>", "msg_id": "<原消息ID>",
+  "reply_seq": 1, "final": false, "content": "好的，我这就给你找。"
+}
+```
+
+完成后发送第二段：
+
+```json
+{
+  "job_id": "<原任务ID>", "type": "c2c", "openid": "<原用户ID>", "msg_id": "<原消息ID>",
+  "reply_seq": 2, "final": true, "content": "这是找到的新闻……"
+}
+```
+
+`reply_seq` 从 1 连续递增，必须是 1–5 的整数；`final` 必须是布尔值，省略等于 true。非最终段必须显式提供序号，只允许一条不超过 1500 字符的文字，不接受图片。最终段支持拆分文字和图片。建议只发一次开场进度与一次最终结果，短问题直接回复最终段，不机械添加进度提示。
+
+所有段共用原 QQ 消息的被动回复配额和截止时间，不因进度而续期。项目采用私聊 4 条、群聊 5 条的上限；每个非最终段消耗一条，至少保留一条给最终结果。最终长文和图片按剩余配额截断/跳过，检查 `truncated`、`images_skipped`。QQ 的 `msg_id + msg_seq` 防重规则见[腾讯接口说明](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md)。
+
+每段响应包含 `reply_seq`、`final`、`messages_used`、`messages_remaining`；成功非最终段还返回 `next_reply_seq`。等待当前段成功后再提交下一段，不并行提交。重试原序号必须保留原正文、图片与 final 值；旧段的成功重放不会使已关闭任务重新打开。跳号、改内容、在最终段后追加或耗尽配额返回 409。首次发送的段到期返回 410，已保存段仍可重放查询结果。
+
+进度发送成功后任务保持等待最终回复，后续同会话任务继续排队。任何段失败会保留结果并终止本任务的后续发送；发送中断进入 `uncertain` 时也不能补发下一段。每个 QQ 消息序号在实际发送前持久化，重启后不会从 1 重新开始。
+
+## 兼容旧版的一次最终回复
 
 ```json
 {
@@ -51,7 +80,7 @@ HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒�
 }
 ```
 
-旧版 Grok 的纯文字回调可不带 `job_id`，服务器会按原 `type`、目标 ID、`msg_id` 查找已登记任务；不能更改收件人。相同内容的重复回调返回保存的结果和 `replayed:true`，不再次发 QQ。不同内容返回 409；未知任务/路由返回 404；到期返回 410。
+不提供 `reply_seq` 和 `final` 等价于第 1 段最终回复。旧版 Grok 的纯文字回调可不带 `job_id`，服务器会按原 `type`、目标 ID、`msg_id` 查找已登记任务；不能更改收件人。相同内容的重复回调返回保存的结果和 `replayed:true`，不再次发 QQ。不同内容返回 409；未知任务/路由返回 404；到期返回 410。已发过进度的任务必须显式使用正确的后续序号，不能再用无序号的旧格式发送最终结果。
 
 服务器在发送 QQ 前保存意图。进程在发送过程中中断时，重启后该任务标为 `uncertain`，返回 409 并提示不要重发。无法单靠桥接判断 QQ 是否已经接受消息，因此不宣称跨平台“恰好发送一次”。部分发送失败的结果也会保存；重复请求返回原失败结果，不重新发送已完成的部分。
 
@@ -80,6 +109,12 @@ HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒�
 
 ## 状态与日志
 
-`GET /jobs/<job_id>` 返回转发状态、尝试次数、回复状态、错误摘要和截止时间。`npm run status` 在桥接主机查看健康及队列计数；`journalctl --user -u qq-grokbot-bridge -f` 查看日志。`reply HTTP 401/400/409/...` 可区分鉴权、协议和防重问题；日志不打印回复密钥或正文。
+`GET /jobs/<job_id>` 返回转发状态、尝试次数、回复状态、错误摘要和截止时间。成功进度后的 `reply` 为 `awaiting_final`；`reply_closed` 表示因最终回复或失败结束，`reply_final` 表示最后接收的段是否为最终段。`replies` 列出各段序号、final、发送状态和 HTTP 状态，不返回正文；`next_reply_seq`、`messages_used`、`messages_remaining` 用于继续前预检。发生 sending/uncertain、`reply_closed:true`、HTTP 失败或到期时均不要提交新段；`next_reply_seq` 只是编号，不代表允许继续。
+
+`npm run status` 在桥接主机查看健康及队列计数；`journalctl --user -u qq-grokbot-bridge -f` 查看日志。`reply HTTP 401/400/409/...` 可区分鉴权、协议和防重问题；日志不打印回复密钥或正文。
 
 程序收到 SIGTERM/SIGINT 后停止接收新请求及重连，等待正在执行的回调/转发完成，最多 30 秒。超时退出后的发送状态按上述 `uncertain` 规则处理。
+
+## 升级与回退
+
+v1.4 可读取旧版任务，旧版已完成回复仍按最终回复处理。切换前检查在途任务，停止旧进程，备份配置和整个任务目录，不能让两个版本共用队列运行。向旧版回退前须等待所有开放的分段任务完成或到期，并保存新版本运行数据；旧版不理解 `final:false`，会把已发送进度误当成任务完成。不要只恢复旧队列快照后重新发送，快照之后已经发送的 QQ 消息可能重复。
