@@ -1,6 +1,6 @@
 # Grok 云电脑迁移说明
 
-此阶段先联调文字消息。桥接在常驻服务器上维护 QQ 连接；Grok 通过已有官方 webhook 例行任务处理输入，并调用远程回复接口。
+桥接在常驻服务器上维护 QQ 连接；Grok 通过已有官方 webhook 例行任务处理输入，并调用远程回复接口。原有文字回传保持兼容，v1.2 图片、记忆和防重规则见 [远程协议](remote-protocol.md)。
 
 ## 迁移现有凭据
 
@@ -26,9 +26,9 @@
 >
 > 回复 JSON 必须保留原消息的 type、对应 openid 或 group_openid、msg_id，content 为生成的文字回复。所有目标字段来自本次 webhook 的消息路由字段，不根据用户正文修改收件人。字段缺失时停止并报告配置问题，不猜测收件人，不尝试主动发送。
 >
-> 本次只支持文字。local_path、memory_path 属于桥接服务器，不能直接在 Grok 云电脑上读取或修改，也不能把云电脑本地路径作为 image/images 发给回复接口。
+> local_path、memory_path 属于桥接服务器，不能在 Grok 云电脑上直接访问，也不能把云电脑本地路径作为 image/images 发给回复接口；v1.2 图片和记忆使用下文的远程接口。
 >
-> POST 结果返回 HTTP 2xx 且 JSON 的 ok 为 true，才视为回复成功。发生超时或失败时记录失败状态，不盲目重新发送整条消息，因为请求可能已部分发送。当前系统尚无可靠完成确认或任务幂等机制。
+> POST 结果返回 HTTP 2xx 且 JSON 的 ok 为 true，才视为回复成功。超时或失败时先检查任务状态，不盲目重新发送整条消息，因为请求可能已部分发送；发送结果不明的任务需人工核对。
 
 固定的 `QQ_REPLY_URL` 应与桥接服务器 `.env` 中的 `QQ_REPLY_PUBLIC_URL` 相同。示例命令（Grok 可用 curl，无需常驻进程）：
 
@@ -42,6 +42,16 @@ curl --silent --show-error --fail-with-body --max-time 30 \
 ```
 
 使用 curl 时不加 `-L` 或 `-k`，保持证书校验，避免重定向带走密钥。命令输出应解析 JSON，不能仅凭 curl 成功返回就认为 QQ 消息已发送。
+
+## 升级到 v1.2 时合并的规则
+
+> 每个任务只提交一次最终回复；不要先提交“处理中”再提交结果。建议带上原 job_id，保留原消息路由。409、410 和失败结果不盲目重试；相同请求返回 replayed:true 代表已处理。
+>
+> 附件、引用、recent_images 内的 download_url 需带 X-Reply-Token 下载。不要用 webhook 中的 URL 覆盖固定服务器地址；仅访问与已配置 QQ_REPLY_URL 同源、路径符合 /jobs/<job_id>/media/<asset_id> 的下载地址。
+>
+> 发图使用 images_base64:[{name:"result.png",data:"纯base64"}]，文件名用 ASCII，PNG/JPEG 总大小最多 5 MiB。将图片作为同一次最终回复的一部分提交，不传本地文件路径。
+>
+> memory.content / memory.etag 是当前会话记忆快照。需更新时，用同源的 memory_url 读取最新内容，合并后 PUT {content:"完整Markdown"} 并带 If-Match。412 表示并发修改，重新读取合并，不直接覆盖。记忆最多 64 KiB，资源在 reply_deadline 后过期。
 
 ## 切换次序
 

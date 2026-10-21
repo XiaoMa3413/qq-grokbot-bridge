@@ -19,7 +19,10 @@ async function main() {
     headers: { 'Content-Type': 'application/json', 'X-Reply-Token': loadReplyToken() },
     body: JSON.stringify(reply),
   });
-  process.stdout.write(await response.text() + '\n');
-  if (!response.ok) process.exitCode = 1;
+  const text = await response.text();
+  process.stdout.write(text + '\n');
+  let result;
+  try { result = JSON.parse(text); } catch { /* A proxy error page is a failure. */ }
+  if (!response.ok || result?.ok !== true) process.exitCode = 1;
 }
 main().catch(e => { console.error(e.message); process.exitCode = 1; });

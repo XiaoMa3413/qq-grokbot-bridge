@@ -2,6 +2,7 @@
 const http = require('http'), fs = require('fs'), path = require('path');
 const { log } = require('./lib');
 const { append } = require('./history');
+const { decodeImages, replyFingerprint } = require('./remote');
 const MAX_LEN = 1500;                        // QQ message content limit we split at
 const TRUNC_NOTE = '\n…（内容过长，已截断）';
 const ACTIVE_MAX = 5;                        // active (no msg_id): at most 5 messages
@@ -58,20 +59,25 @@ function loadImages(j) {
   }
   return { files };
 }
-function createReplyServer(api, token, getHealth, { remote = false } = {}) {
+function createReplyServer(api, token, getHealth, { remote = false, store = null, access = null } = {}) {
   return http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
-    const send = (c, o) => { res.writeHead(c, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+    const send = (c, o) => {
+      if (res.destroyed || res.writableEnded) return;
+      res.writeHead(c, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o));
+    };
     if (req.method === 'GET' && req.url === '/health') {
       const h = getHealth ? getHealth() : { ok: true };
       return send(h.ok ? 200 : 503, h);
     }
-    if (req.method !== 'POST' || req.url !== '/reply') return send(404, { ok: false, error: 'not found' });
+    if (req.method === 'POST' && req.url === '/reply') res.on('finish', () => log('reply HTTP', res.statusCode));
     if (req.headers['x-reply-token'] !== token) return send(401, { ok: false, error: 'bad token' });
+    if (access && access.handle(req, res, send)) return;
+    if (req.method !== 'POST' || req.url !== '/reply') return send(404, { ok: false, error: 'not found' });
     let chunks = [], size = 0, tooLarge = false;
     req.on('data', c => {
       if (tooLarge) return;
       size += c.length;
-      if (size > 1e6) { tooLarge = true; chunks = []; send(413, { ok: false, error: 'body too large' }); return; }
+      if (size > (store ? 8 * 1024 * 1024 : 1e6)) { tooLarge = true; chunks = []; send(413, { ok: false, error: 'body too large' }); return; }
       chunks.push(c);
     });
     req.on('end', async () => {
@@ -80,15 +86,35 @@ function createReplyServer(api, token, getHealth, { remote = false } = {}) {
       if (!j || typeof j !== 'object' || Array.isArray(j)) return send(400, { ok: false, error: 'need a JSON object' });
       const target = j.type === 'c2c' ? j.openid : j.type === 'group' ? j.group_openid : null;
       const hasText = typeof j.content === 'string' && j.content.length > 0;
-      const hasImg = j.image !== undefined || j.images !== undefined;
-      if (remote && hasImg) return send(400, { ok: false, error: 'remote replies currently support text only; server file paths are not accepted' });
+      const hasLocalImg = j.image !== undefined || j.images !== undefined;
+      const hasImg = hasLocalImg || j.images_base64 !== undefined;
+      if (remote && hasLocalImg) return send(400, { ok: false, error: 'server file paths are not accepted; use images_base64' });
+      if (!remote && j.images_base64 !== undefined) return send(400, { ok: false, error: 'images_base64 requires remote mode' });
       if (remote && (typeof j.msg_id !== 'string' || !j.msg_id.trim()))
         return send(400, { ok: false, error: 'remote replies require the original msg_id' });
       if (typeof target !== 'string') return send(400, { ok: false, error: 'target must be a string' });
       if (!target || (!hasText && !hasImg) || (j.content !== undefined && typeof j.content !== 'string'))
         return send(400, { ok: false, error: 'need type(c2c|group), openid|group_openid, content and/or image(s)' });
-      const imgs = loadImages(j);
+      const imgs = remote ? decodeImages(j) : loadImages(j);
       if (imgs.error) return send(400, { ok: false, error: imgs.error });
+      const job = store ? store.findReply(j) : null;
+      if (store && !job) return send(404, { ok: false, error: 'unknown message route or job_id' });
+      if (job) {
+        try {
+          const cached = store.beginReply(job, replyFingerprint(j, imgs.files));
+          if (cached) return send(cached.status, cached.body);
+        } catch { return send(503, { ok: false, error: 'cannot persist reply intent; no message sent' }); }
+      }
+      const complete = (status, body) => {
+        if (job) {
+          try { store.finishReply(job, status, body); }
+          catch {
+            job.reply.state = 'uncertain';
+            return send(503, { ok: false, error: 'reply outcome could not be persisted; do not resend' });
+          }
+        }
+        send(status, body);
+      };
       try {
         const sentBefore = j.msg_id ? (api.seq.get(j.msg_id) || 0) : 0;
         const plan = hasText ? planParts(j.content, j.type, j.msg_id, sentBefore) : { parts: [], total: 0, truncated: false };
@@ -116,9 +142,9 @@ function createReplyServer(api, token, getHealth, { remote = false } = {}) {
           result: results.length ? results[0] : null, results };
         if (hasImg) Object.assign(body, { images_sent: imagesSent.length, images_total: imgs.files.length, images_skipped: imgs.files.length - toSend.length });
         if (failure) { log('reply failed', failure.message, JSON.stringify(failure.body || ''));
-          return send(502, { ...body, ok: false, error: failure.message, detail: failure.body }); }
-        send(200, body);
-      } catch (e) { log('reply failed', e.message, JSON.stringify(e.body || '')); send(502, { ok: false, error: e.message, detail: e.body }); }
+          return complete(502, { ...body, ok: false, error: failure.message, detail: failure.body }); }
+        complete(200, body);
+      } catch (e) { log('reply failed', e.message, JSON.stringify(e.body || '')); complete(502, { ok: false, error: e.message, detail: e.body }); }
     });
   });
 }

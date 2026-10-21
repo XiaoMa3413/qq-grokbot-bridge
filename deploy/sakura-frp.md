@@ -1,6 +1,6 @@
 # 在 DGX Spark 上部署，使用 Sakura FRP 回传回复
 
-当前阶段提供远程**文字回复**和独立隧道探测；图片/记忆文件跨机访问、持久化任务队列、完成确认、重复任务去重尚未实现。不要把探测成功理解为 Grok 休眠唤醒或 QQ 收发已验证。
+提供远程回复和独立隧道探测；v1.2 已支持持久化队列、回调防重、图片和记忆接口，详见 [远程协议](remote-protocol.md)。不要把探测成功理解为 Grok 休眠唤醒或 QQ 收发已验证。
 
 ## 1. 创建独立隧道
 
@@ -63,7 +63,7 @@ Remove-Variable probeToken
 QQ_REPLY_PUBLIC_URL=https://<绑定子域名>:<远程端口>/reply
 ```
 
-此变量会启用远程文字模式：拒绝 `image` / `images`（禁止远程请求读取服务器本地图片），并要求原始 `msg_id`。转发给 Grok 的 JSON 会多一个 `reply_url`；不会在载荷中附带回复 token。其余历史和附件字段保持兼容，但 `local_path` / `memory_path` 属于桥接主机，Grok 不能直接读取这些路径。
+此变量会启用持久化远程模式：拒绝 `image` / `images`（禁止远程请求读取服务器本地图片），并要求原始消息路由。转发给 Grok 的 JSON 包含 `job_id`、`reply_url`、`reply_deadline`、图片下载地址和记忆快照；不会附带回复 token，也不会暴露 `local_path` / `memory_path`。
 
 先停止探测服务、停止 Grok 云电脑上旧的桥接进程，再启动新桥接，避免两处同时处理消息：
 
@@ -99,4 +99,4 @@ Grok 可以直接用 HTTP 工具 POST，或使用 `scripts/reply.js`（需 Node.
 
 远程接口需要 `X-Reply-Token` 请求头；`reply.js` 自动读取配置，不跟随重定向，非本机地址必须 HTTPS。Windows 也能用 `Get-Content reply.json -Raw | npm run reply`，Linux 使用 `npm run reply < reply.json`。本机回传默认地址仍为 `http://127.0.0.1:8787/reply`，远程执行时必须设置 `QQ_REPLY_URL`。
 
-依次验证：Grok 清醒时收发文字；休眠时从外部 webhook 启动任务并回传；连续多条消息；重启桥接后的恢复。记录收到 QQ 消息、webhook 接收、Grok 开始执行、QQ 回复成功的时间。群聊回复时限尤其需要实测。探测通过后仍可能因 Grok 用量、审批、任务排队或 QQ 时限导致失败；当前没有持久化队列，不保证故障期间的任务补发。
+依次验证：Grok 清醒时收发文字；休眠时从外部 webhook 启动任务并回传；连续多条消息；图片与记忆；重启桥接后的恢复。记录各阶段时间。持久化队列不延长 QQ 回复时限；仍可能因 Grok 用量、审批、平台重复执行、排队或 QQ 时限而失败，不能保证所有故障下都补发成功。

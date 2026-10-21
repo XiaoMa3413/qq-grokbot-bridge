@@ -1,6 +1,8 @@
 # Grok Bot ⇄ QQ 官方机器人桥接
 
-一个 Node.js 小程序，把 QQ 官方机器人（API v2）收到的消息转给你的 Grok Bot 智能体。智能体通过本地回复接口把回复发回 QQ。
+一个 Node.js 小程序，把 QQ 官方机器人（API v2）收到的消息转给你的 Grok Bot 智能体。支持本机部署，或常驻 Windows/ARM64 Linux 桥接 + Grok 云电脑分离部署。
+
+当前版本 **1.2.0**。发布记录见 [CHANGELOG](CHANGELOG.md)，远程接口见 [v1.2 协议](deploy/remote-protocol.md)，升级与回退见 [版本管理](deploy/releases.md)。
 
 - **入站**：QQ WebSocket 网关 → 本程序 → POST 到 Grok Bot 智能体的 webhook
 - **出站**：智能体 → `POST http://127.0.0.1:8787/reply` → 本程序 → QQ OpenAPI
@@ -23,11 +25,11 @@ flowchart LR
 - **群内非 @ 消息（`GROUP_MESSAGE_CREATE`）**：只记录、不打扰。需要在 QQ 群的机器人设置里开启「获取@机器人的最近10条消息」后才会推送；收到后先按 `msg_id` 去重（与被 @ 的消息共用同一张去重表），再下载图片附件、写入该群的对话历史，**不转发**给智能体、**不回复**。其中最近 10 分钟内的图片会进入一个群内缓存（最多 5 张，按时间升序），之后有人 @ 机器人时随 `recent_images` 一起转发。
 - **其他事件**：不认识的事件类型只在日志里记一行类型名，不解析、不转发。
 - **对话历史**：每个会话（私聊按 openid，群按 group_openid）保存为 JSONL 文件。转发时附带该类型会话最近的若干条记录（`history` 字段），不含当前这条；默认私聊最近 20 条、群聊最近 10 条。文件条数超过「上限 + 10」时裁剪回上限（私聊超过 30 条裁到 20 条，群聊超过 20 条裁到 10 条），每条内容最多保留 2000 字符。上限可在 `config.json` 中用 `historyLimitC2c` / `historyLimitGroup` 配置。机器人发出的回复也会写入历史。
-- **会话记忆文件**：每个会话有一个 Markdown 文件，不存在时自动创建为空文件，路径通过 `memory_path` 交给智能体。桥接本身不读也不写其中内容，由智能体自行维护。
+- **会话记忆文件**：每个会话有一个 Markdown 文件，不存在时自动创建。本机模式通过 `memory_path` 访问；远程模式附带记忆快照和带并发保护的读写接口。
 - **图片附件**：`image/*` 附件会下载到本地（单张上限 20 MB，超时 15 秒），成功后在附件上写入 `local_path`（绝对路径），失败则为 `null`。下载失败不影响消息转发。
 - **长回复拆分**：超过 1500 字符的回复按段落（`\n\n`）、换行、硬切的优先级拆成多条。
 - **遵守 QQ 被动回复限制**：同一 `msg_id` 下，私聊最多 4 条、群聊最多 5 条；不带 `msg_id` 的主动消息单次最多 5 条。超出部分会截断，最后一条末尾加上 `…（内容过长，已截断）`。`msg_seq` 自动递增。
-- **断线重连**：支持心跳、Resume 和指数退避重连（上限 60 秒）。access token 到期前自动刷新。webhook 转发失败最多重试 3 次。连接不健康时由看门狗退出并交给守护脚本重启，见「稳定性、超时与看门狗」。
+- **断线重连**：支持心跳、Resume 和指数退避重连（上限 60 秒）。access token 到期前自动刷新。本机 webhook 失败最多尝试 3 次；远程模式在消息时限内持久化重试。连接不健康时退出并由守护脚本/systemd 重启。
 
 ## 环境要求
 
@@ -60,11 +62,11 @@ flowchart LR
 
 - `npm start`：从项目 `.env`（如存在）加载配置，前台运行桥接。
 - `npm run probe`：只启动隧道探测接口，不连接 QQ 或 Grok。
-- `QQ_REPLY_PUBLIC_URL`：完整外部 HTTPS 回复地址，必须以 `/reply` 结尾。设置后启用远程文字模式，拒绝本地图片路径并要求 `msg_id`。
+- `QQ_REPLY_PUBLIC_URL`：完整外部 HTTPS 回复地址，必须以 `/reply` 结尾。设置后启用持久化远程模式，拒绝本地图片路径，回调必须匹配已登记消息。
 - `QQ_REPLY_TOKEN`：可选固定回复密钥，至少 32 字符；不设置时使用自动生成的 `reply_token`。
 - `QQ_REPLY_URL`：跨平台回复客户端 `npm run reply` 的目的地址；通过 stdin 传入回复 JSON，远程地址必须 HTTPS。
 
-Grok 云电脑里的图片和记忆文件跨机访问，以及任务持久化、完成确认和幂等处理仍需后续适配。
+远程图片使用鉴权下载和 `images_base64` 回传，记忆通过任务关联的 GET/PUT 接口访问。`QQ_JOBS_DIR` 可更改默认的 `data/jobs` 队列目录，`npm run status` 查看运行状态。webhook 响应丢失仍可能重复触发 Grok；回复发送中断时会保留“不确定”状态，避免自动重发，详见协议文档。
 
 ## config.json
 
@@ -225,6 +227,7 @@ IMAGE=/abs/path/a.png ./reply.sh c2c <openid> <msg_id|-> [文字|-]   # 附带�
 |---|---|
 | `data/history/<type>-<id>.jsonl` | 对话历史 |
 | `data/media/<msg_id>-<n>.<ext>` | 下载的图片 |
+| `data/jobs/<job_id>.json` | 远程任务、转发尝试和回复结果，权限 600 |
 | `memory/<type>-<id>.md` | 会话记忆，由智能体维护 |
 | `logs/` | 运行日志和调试用的原始事件 |
 

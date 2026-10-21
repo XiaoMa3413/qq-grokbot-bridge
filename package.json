@@ -1,6 +1,6 @@
 {
   "name": "qq-bridge",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "",
   "main": "bridge.js",
   "engines": {
@@ -13,7 +13,8 @@
     "start": "node --env-file-if-exists=.env bridge.js",
     "probe": "node --env-file-if-exists=.env scripts/tunnel-probe.js",
     "reply": "node --env-file-if-exists=.env scripts/reply.js",
-    "test": "node test/test.js && node --test test/remote.test.js"
+    "status": "node --env-file-if-exists=.env scripts/status.js",
+    "test": "node test/test.js && node --test test/remote.test.js test/reliability.test.js test/bridge.integration.test.js"
   },
   "keywords": [],
   "author": "",
