@@ -45,7 +45,7 @@ flowchart LR
 | 对话历史与记忆 | 私聊最多 20 条、群聊最多 10 条历史，关联完整问答并按身份/引用选择；每会话独立 Markdown 记忆，远程写入有并发校验 |
 | 图片 | 入站图片提供鉴权下载；远程回图使用 `images_base64`，支持 PNG/JPEG |
 | 持久化队列 | 远程模式先落盘再转发；同会话顺序处理，不同会话最多并行 4 个任务 |
-| 重试与回调防重 | 转发网络错误、408/429/5xx 按时限重试；相同最终回调返回已保存结果，避免重复发 QQ |
+| 重试与回调防重 | 明确连接前失败及 429 按时限重试；投递结果不明暂停重投；相同最终回调返回已保存结果 |
 | 分段回复 | Grok 可先回“正在处理”，再发最终结果；每段有序号并独立防重，共享原消息配额和截止时间 |
 | 运维 | `/health`、任务状态接口、心跳与断线恢复；Linux systemd 提供退出后重启 |
 
@@ -53,7 +53,7 @@ flowchart LR
 
 进度由 Grok 开始执行后主动回传，桥接不会在唤醒前自动代发确认；修改任务规则后才会使用分段能力。进度提示不占用正文历史条数。当前的[上下文机制](deploy/conversation-context.md)会关联问答，并对历史、引用和最近群上下文应用总文字预算；任务追加要求与更完整的记忆管理仍见[后续设计](deploy/context-design.md)。
 
-回复时限按原 QQ 消息计时：群聊 5 分钟、私聊 60 分钟，排队不会延长时限。Grok 执行慢、等待审批或配额不足仍可能导致到期。webhook 响应丢失可能重复触发 Grok；发送 QQ 时中断会标记 `uncertain`，需核对结果，不自动重发。详细语义见 [远程协议](deploy/remote-protocol.md)。
+回复时限按原 QQ 消息计时：群聊 5 分钟、私聊 60 分钟，排队不会延长时限。Grok 执行慢、等待审批或配额不足仍可能导致到期。webhook 响应丢失、408/5xx 或发送时进程中断会标记投递 `uncertain`，暂停自动重投，核对远端后可用主机管理命令安排重投；发送 QQ 时中断也需核对结果，不自动重发。详细语义见 [投递恢复](deploy/forward-recovery.md) 和 [远程协议](deploy/remote-protocol.md)。
 
 ## 手动快速开始
 
@@ -167,6 +167,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | 本地测试 | `npm test`，使用临时目录和模拟 QQ/webhook，不需要真实凭据 |
 | 仅测隧道 | `npm run probe`，不连接 QQ；不能与真实桥接占用同一端口 |
 | 查看健康 | `npm run status`；`GET /health` 不健康时返回 503 |
+| 诊断与人工重投 | `npm run jobs -- list` / `show --job <job_id>`；停止服务后按[恢复流程](deploy/forward-recovery.md)执行 `retry` |
 | 查看服务日志 | `journalctl --user -u qq-grokbot-bridge -f` |
 | 启动 Linux 服务 | `systemctl --user start qq-grokbot-bridge`，停止或重启使用 `stop` / `restart` |
 | 远程回传 | 使用 HTTP 工具，或配置 `QQ_REPLY_URL` / `QQ_REPLY_TOKEN` 后运行 `npm run reply`，JSON 从 stdin 输入 |
@@ -200,6 +201,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | [交给 agent 部署](DEPLOY_AGENT.md) | 完整安装、迁移和验收流程 |
 | [Grok 任务配置](deploy/grok-routine.md) | 凭据迁移及可复制的例行任务规则 |
 | [远程协议](deploy/remote-protocol.md) | 任务、图片、记忆、错误码及恢复语义 |
+| [投递诊断与人工重投](deploy/forward-recovery.md) | 结果不明分类、只读诊断、版本检查与主机重投流程 |
 | [角色与选定事实导入](deploy/knowledge-import.md) | 按会话预览/提交、来源版本、删除与任务只读快照 |
 | [Sakura FRP 部署示例](deploy/sakura-frp.md) | 通用隧道设置与连通性验证 |
 | [版本与回退](deploy/releases.md) | 发布、升级、备份和回退 |

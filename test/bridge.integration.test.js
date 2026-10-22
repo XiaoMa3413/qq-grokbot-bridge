@@ -19,7 +19,7 @@ test('real bridge process recovers a queued webhook after restart and accepts th
     req.on('end', async () => {
       if (req.url === '/webhook') {
         const payload = JSON.parse(raw); deliveries.push(payload);
-        if (phase === 1) { res.writeHead(503); return res.end('{}'); }
+        if (phase === 1) { res.writeHead(429); return res.end('{}'); }
         res.end('{}');
         try {
           const response = await fetch(`http://127.0.0.1:${replyPort}/reply`, { method: 'POST',

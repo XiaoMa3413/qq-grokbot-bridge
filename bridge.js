@@ -77,11 +77,13 @@ const worker = jobs ? new ForwardWorker(jobs, { log, prepare: async (p, job) => 
   await prepareInbound(p);
   return remoteAccess.payload(p, job);
 }, send: async p => {
-  if (!gatewayReady || wsRef?.readyState !== WebSocket.OPEN || !sessionId) throw new Error('QQ is reconnecting');
+  if (!gatewayReady || wsRef?.readyState !== WebSocket.OPEN || !sessionId)
+    throw Object.assign(new Error('QQ is reconnecting'), { code: 'EFORWARDNOTSENT' });
   const response = await sendWebhook(p);
   const retryAfter = response.headers.get('retry-after');
   const retryAfterMs = /^\d+$/.test(retryAfter || '') ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now()) || 0;
-  await response.body?.cancel();
+  // Headers already establish the HTTP result; body cleanup must not erase it.
+  try { await response.body?.cancel(); } catch { /* No response body is needed. */ }
   return { ok: response.ok, status: response.status, retryAfterMs };
 } }) : null;
 function runWorker() {

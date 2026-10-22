@@ -2,6 +2,7 @@
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { REPLY_LIMITS } = require('./policy');
 const { digest, targetOf, idOf, readJobs } = require('./job_state');
+const { transportOutcome, responseOutcome, interruptedForward } = require('./forwarding');
 const repliesOf = job => job.replies || (job.reply ? [job.reply] : []);
 const replyClosed = job => job.reply?.state === 'done' && (job.reply.final !== false || !job.reply.body?.ok);
 function atomicFile(file, contents) {
@@ -31,7 +32,7 @@ class JobStore {
     for (const job of restored) {
       this.order = Math.max(this.order, job.order);
       this.jobs.set(job.id, job);
-      if (job.delivery === 'dispatching') { job.delivery = 'pending'; job.nextAttemptAt = now(); this.save(job); }
+      if (job.delivery === 'dispatching') { Object.assign(job, interruptedForward(job, now())); this.save(job); }
       if (job.reply?.state === 'sending') { job.reply.state = 'uncertain'; this.save(job); }
     }
     this.prune();
@@ -81,7 +82,9 @@ class JobStore {
     if (this.now() >= job.deadline) return { status: 410, body: { ok: false, error: 'QQ reply window expired' } };
     const reply = { state: 'sending', fingerprint, startedAt: this.now(), seq, final };
     // Publish in-memory state only after the intent is durable.
-    const next = { ...job, replies: [...records, reply], reply };
+    const next = { ...job, replies: [...records, reply], reply, delivery: 'accepted',
+      forward: { phase: 'settled', outcome: 'accepted', code: 'callback_received',
+        startedAt: job.forward?.startedAt ?? this.now(), completedAt: this.now() } };
     this.save(next); Object.assign(job, next);
     return null;
   }
@@ -91,12 +94,14 @@ class JobStore {
     this.save(next); Object.assign(job, next);
   }
   summary() {
-    const summary = { pending: 0, awaiting_reply: 0, replying: 0, completed: 0, failed: 0, expired: 0, uncertain: 0 };
+    const summary = { pending: 0, awaiting_reply: 0, replying: 0, completed: 0, failed: 0, expired: 0, uncertain: 0,
+      forward_uncertain: 0 };
     for (const job of this.jobs.values()) {
       if (job.reply?.state === 'uncertain') summary.uncertain++;
       else if (job.reply?.state === 'sending') summary.replying++;
       else if (replyClosed(job)) summary[job.reply.body.ok ? 'completed' : 'failed']++;
       else if (this.now() >= job.deadline || job.delivery === 'expired') summary.expired++;
+      else if (job.delivery === 'uncertain') { summary.uncertain++; summary.forward_uncertain++; }
       else if (job.delivery === 'failed') summary.failed++;
       else if (job.delivery === 'accepted' || job.reply) summary.awaiting_reply++;
       else summary.pending++;
@@ -129,30 +134,52 @@ class ForwardWorker {
   }
   async dispatch(job) {
     // A failed intent write must leave the live job pending for the next worker tick.
-    const next = { ...job, delivery: 'dispatching', attempts: job.attempts + 1 };
+    const next = { ...job, delivery: 'dispatching', attempts: job.attempts + 1,
+      forward: { phase: 'preparing', code: 'preparing', startedAt: this.store.now() } };
     this.store.save(next); Object.assign(job, next);
+    let outcome;
     try {
       if (!job.prepared) {
         const prepared = await this.prepare(structuredClone(job.payload), job);
         job.payload = prepared; job.prepared = true; this.store.save(job);
       }
       if (this.store.now() >= job.deadline) { job.delivery = 'expired'; this.store.save(job); return; }
-      const response = await this.send(job.payload, job);
-      // A fast callback can arrive before the webhook request completes; keep its outcome.
-      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-      if (response.ok) { job.delivery = 'accepted'; job.acceptedAt = this.store.now(); this.log('forwarded', job.id); }
-      else if (retryable) {
-        job.delivery = 'pending'; job.nextAttemptAt = this.retryAt(job, response.retryAfterMs);
-        job.lastError = 'HTTP ' + response.status; this.log('forward retry', job.id, job.lastError);
-      } else { job.delivery = 'failed'; job.lastError = 'HTTP ' + response.status; this.log('forward failed', job.id, job.lastError); }
     } catch {
-      job.delivery = 'pending'; job.nextAttemptAt = this.retryAt(job);
-      job.lastError = 'transport or preparation failed'; this.log('forward retry', job.id, job.lastError);
+      outcome = { outcome: 'retryable', code: 'preparation_failed' };
     }
-    this.store.save(job);
+    if (!outcome && job.reply) outcome = { outcome: 'accepted', code: 'callback_received' };
+    if (!outcome) {
+      // Once this intent is durable, a crash may have followed remote acceptance.
+      // Do not run send if the write fails, and keep the live phase recoverable.
+      const sending = { ...job, forward: { phase: 'sending', code: 'sending', startedAt: job.forward.startedAt } };
+      try { this.store.save(sending); }
+      catch (error) {
+        // No HTTP call was made. Retry the write on a later tick; an on-disk
+        // sending intent after a failed fsync still recovers conservatively.
+        job.delivery = 'pending'; job.nextAttemptAt = this.retryAt(job);
+        throw error;
+      }
+      Object.assign(job, sending);
+      try {
+        const response = await this.send(job.payload, job);
+        outcome = { ...responseOutcome(response), retryAfterMs: response.retryAfterMs };
+      } catch (error) { outcome = transportOutcome(error); }
+    }
+    // A callback is stronger evidence than a missing or negative webhook ack.
+    if (job.reply) outcome = { outcome: 'accepted', code: 'callback_received' };
+    const settled = { ...job, delivery: outcome.outcome === 'retryable' ? 'pending' : outcome.outcome,
+      forward: { phase: 'settled', outcome: outcome.outcome, code: outcome.code, startedAt: job.forward.startedAt,
+        completedAt: this.store.now(), ...(outcome.httpStatus ? { httpStatus: outcome.httpStatus } : {}) } };
+    if (outcome.outcome === 'retryable') settled.nextAttemptAt = this.retryAt(job, outcome.retryAfterMs);
+    if (outcome.outcome === 'accepted') { settled.acceptedAt = this.store.now(); delete settled.lastError; }
+    else settled.lastError = outcome.code + (outcome.httpStatus ? ' HTTP ' + outcome.httpStatus : '');
+    this.store.save(settled); Object.assign(job, settled);
+    if (outcome.outcome === 'accepted') delete job.lastError;
+    this.log(outcome.outcome === 'accepted' ? 'forwarded' : outcome.outcome === 'retryable' ? 'forward retry' : 'forward ' + outcome.outcome, job.id, outcome.code);
   }
   retryAt(job, retryAfterMs = 0) {
-    return this.store.now() + Math.max(Math.min(60000, 1000 * 2 ** Math.min(job.attempts, 10)), Math.max(0, retryAfterMs || 0));
+    const requested = typeof retryAfterMs === 'number' && !Number.isNaN(retryAfterMs) ? Math.max(0, retryAfterMs) : 0;
+    return Math.min(job.deadline, this.store.now() + Math.max(Math.min(60000, 1000 * 2 ** Math.min(job.attempts, 10)), requested));
   }
 }
 module.exports = { JobStore, ForwardWorker, atomicWrite, atomicFile, digest, idOf, targetOf, repliesOf, replyClosed };

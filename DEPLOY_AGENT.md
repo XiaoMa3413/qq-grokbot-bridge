@@ -160,7 +160,7 @@ npm run --silent doctor -- --remote --json
 >
 > 按 knowledge.revision 和 profile.version 区分任务快照，可复用本次载荷内容；日常回答无需展示版本哈希，核对来源或处理冲突时再说明资料出处。需要核实时，仅对同源且路径为 /jobs/<本次job_id>/knowledge 的 knowledge_url 带 X-Reply-Token GET；接口仍返回本任务快照，不会取得资料库之后的新版本。不得 PUT 此资源，也不要把导入档案整份复制到 memory 造成重复或让已删事实从另一层自动复活。用户要求更正或忘记导入条目时，说明需要通过桥接主机的预览/提交流程处理；不要声称已删除平台记忆。旧载荷缺少 knowledge 时按原规则处理，不猜测角色或导入资料。
 >
-> 仅 HTTP 2xx 且响应 JSON ok:true 视为发送成功；replayed:true 表示已处理，没有再次发送 QQ。超时或失败先用同源 GET /jobs/<job_id> 查询状态，不盲目重发。409、410、uncertain 或部分发送失败需要核对结果；不能改正文、路由或删任务来强制补发。平台 webhook 可能重复执行，先检查任务是否已有最终结果。
+> 仅 HTTP 2xx 且响应 JSON ok:true 视为发送成功；replayed:true 表示已处理，没有再次发送 QQ。超时或失败先用同源 GET /jobs/<job_id> 查询状态，不盲目重发。409、410、uncertain 或部分发送失败需要核对结果；不能改正文、路由或删任务来强制补发。平台 webhook 可能重复执行，先检查任务是否已有最终结果。delivery:uncertain 表示桥接未确认 webhook 投递结果，本次执行若有完整路由且仍在期限内，可以正常回传；它不同于 reply:uncertain，后者禁止追加回复。不要自行重新触发 webhook，人工重投由操作者在桥接主机完成。
 
 私聊最终回复结构（占位符取自本次载荷）：
 
@@ -256,7 +256,9 @@ npm start
 
 失败时停止新实例，恢复原源码、依赖与服务配置后启动旧实例。新服务已处理消息时，不直接恢复陈旧队列备份，否则可能重复发送；先核对新旧状态。回退到 v1.1.0 无法处理 v1.2 任务或远程图片/记忆接口，需等待任务完成并保留新版数据。不要删除 `uncertain` 文件或改 `msg_id` 来重发。
 
-详细版本管理见 [发布与回退说明](deploy/releases.md)，接口字段以 [v1.2 协议](deploy/remote-protocol.md) 为准。
+投递结果不明时先按[投递诊断与人工重投](deploy/forward-recovery.md)核对远端，不删除任务、不自动强制重试。`jobs retry` 必须在停止桥接后执行，并校验任务版本与重复执行风险；原截止时间不延长。回退到 v1.7 之前还需处理新增的投递 `uncertain` 状态，不能直接套用旧恢复行为。
+
+详细版本管理见 [发布与回退说明](deploy/releases.md)，接口字段以 [远程协议](deploy/remote-protocol.md) 为准。
 
 ## 10. 完成报告
 

@@ -110,11 +110,14 @@ test('pending jobs expire at QQ deadlines and a permanent webhook error is not r
   assert.equal(f.store.summary().expired, 1);
 });
 
-test('a crash during webhook dispatch is recovered, but a crash during QQ send is uncertain', async t => {
+test('a crash during webhook dispatch or QQ send is uncertain and is not automatically resent', async t => {
   const f = setup(t), job = f.store.enqueue(payload()).job;
   job.delivery = 'dispatching'; f.store.save(job);
   const recovered = new JobStore(f.options);
-  assert.equal(recovered.get(job.id).delivery, 'pending');
+  assert.equal(recovered.get(job.id).delivery, 'uncertain');
+  let sends = 0;
+  await new ForwardWorker(recovered, { send: async () => { sends++; } }).runOnce();
+  assert.equal(sends, 0);
   recovered.beginReply(recovered.get(job.id), 'same');
   const crashed = new JobStore(f.options), record = crashed.get(job.id);
   assert.equal(record.reply.state, 'uncertain');

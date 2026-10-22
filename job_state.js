@@ -2,6 +2,7 @@
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 const { REPLY_LIMITS, messageLimit } = require('./policy');
+const { CODES } = require('./forwarding');
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const targetOf = p => p.type === 'group' ? p.group_openid : p.openid;
@@ -25,12 +26,37 @@ function validateJob(job, file) {
   for (const key of ['createdAt', 'deadline', 'nextAttemptAt']) need(time(job[key]), key);
   need(count(job.attempts), 'attempts');
   if (job.acceptedAt !== undefined) need(time(job.acceptedAt), 'acceptedAt');
-  need(['pending', 'dispatching', 'accepted', 'failed', 'expired'].includes(job.delivery), 'delivery');
+  need(['pending', 'dispatching', 'accepted', 'failed', 'expired', 'uncertain'].includes(job.delivery), 'delivery');
   need(typeof job.prepared === 'boolean', 'prepared');
   need(object(job.assets) && Object.entries(job.assets).every(([key, value]) => /^[a-f0-9]{64}$/.test(key)
     && typeof value === 'string' && !!value), 'assets');
   if (job.lastError !== undefined) need(typeof job.lastError === 'string', 'lastError');
   if (job.sentCount !== undefined) need(count(job.sentCount) && job.sentCount <= messageLimit(p.type, p.msg_id), 'sentCount');
+  if (job.forward !== undefined) {
+    const f = job.forward;
+    need(object(f), 'forward');
+    need(['preparing', 'sending', 'settled'].includes(f.phase), 'forward.phase');
+    need(CODES.includes(f.code), 'forward.code');
+    need(time(f.startedAt), 'forward.startedAt');
+    if (f.outcome !== undefined) need(['accepted', 'retryable', 'failed', 'uncertain'].includes(f.outcome), 'forward.outcome');
+    if (f.completedAt !== undefined) need(time(f.completedAt), 'forward.completedAt');
+    if (f.phase === 'settled') {
+      need(['accepted', 'retryable', 'failed', 'uncertain'].includes(f.outcome), 'forward.outcome');
+      need(time(f.completedAt), 'forward.completedAt');
+    }
+    if (f.httpStatus !== undefined) need(Number.isInteger(f.httpStatus) && f.httpStatus >= 200 && f.httpStatus <= 599, 'forward.httpStatus');
+  }
+  if (job.redrives !== undefined) {
+    need(Array.isArray(job.redrives) && job.redrives.length <= 20, 'redrives');
+    const ids = new Set();
+    for (const r of job.redrives) {
+      need(object(r) && typeof r.requestId === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(r.requestId) && !ids.has(r.requestId), 'redrives.requestId');
+      ids.add(r.requestId);
+      need(time(r.at) && typeof r.reason === 'string' && !!r.reason.trim() && r.reason.length <= 200 && !/[\r\n\0]/.test(r.reason), 'redrives.metadata');
+      need(['failed', 'uncertain', 'dispatching'].includes(r.previousDelivery) && typeof r.revision === 'string' && /^[a-f0-9]{64}$/.test(r.revision)
+        && typeof r.ackDuplicateRisk === 'boolean', 'redrives.previous');
+    }
+  }
 
   // Schema 1 before segmented replies stored only `reply`; normalize it in memory.
   // Missing legacy seq/final mean the first and final reply, never a new send.
