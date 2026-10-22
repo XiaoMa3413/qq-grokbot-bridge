@@ -6,6 +6,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,10 +17,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MIB = 1024 * 1024
 HEX = re.compile(r"^[a-f0-9]{64}$")
+TIMING_COMMANDS = {"begin", "status", "progress", "final", "resume", "doctor"}
+HTTP_OPERATIONS = {"status", "upload_status", "upload", "reply", "health"}
+TIMING_ERRORS = {"network_error", "reply_rejected", "client_busy", "reply_needs_review", "task_expired",
+                 "task_status_rejected", "insufficient_reply_quota", "operation_content_conflict", "invalid_outbox",
+                 "operation_failed_needs_review", "reply_closed_or_failed", "invalid_json_response",
+                 "private_artifact_rejected", "invalid_input_or_local_io", "client_error"}
+TIMING_LIMIT = 128
 
 
 class ClientError(Exception):
@@ -40,6 +49,36 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def timestamp(value):
+    require(isinstance(value, str), "invalid_timing_record")
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, "invalid_timing_record")
+    return parsed.astimezone(dt.timezone.utc).isoformat()
+
+
+def duration(value):
+    require(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1e10, "invalid_timing_record")
+    return value
+
+
+def timing_rows(rows):
+    require(isinstance(rows, list) and len(rows) <= 32, "invalid_timing_record")
+    clean = []
+    for row in rows:
+        require(isinstance(row, dict) and row.get("operation") in HTTP_OPERATIONS, "invalid_timing_record")
+        code = row.get("http_status")
+        require(code is None or (type(code) is int and 100 <= code <= 599), "invalid_timing_record")
+        item = {"operation": row["operation"], "http_status": code, "duration_ms": duration(row.get("duration_ms"))}
+        if "started_at" in row:
+            item["started_at"] = timestamp(row["started_at"])
+        clean.append(item)
+    return clean
+
+
 def read_json(file, limit=8 * MIB):
     with open(file, "rb") as source:
         data = source.read(limit + 1)
@@ -49,8 +88,17 @@ def read_json(file, limit=8 * MIB):
     return value
 
 
+def is_link(file):
+    try:
+        info = Path(file).lstat()
+        # Windows junctions are reparse points even when Path.is_symlink() is false.
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+    except FileNotFoundError:
+        return False
+
+
 def private_dir(directory):
-    require(not directory.is_symlink(), "linked_state_directory")
+    require(not is_link(directory), "linked_state_directory")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     require(directory.is_dir(), "invalid_state_directory")
     if os.name != "nt":
@@ -58,7 +106,7 @@ def private_dir(directory):
 
 
 def atomic_json(file, value):
-    require(not file.is_symlink(), "linked_state_file")
+    require(not is_link(file), "linked_state_file")
     fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=file.parent)
     try:
         with os.fdopen(fd, "wb") as output:
@@ -81,7 +129,7 @@ def atomic_json(file, value):
 def job_lock(directory):
     private_dir(directory)
     lock = directory / "lock"
-    require(not lock.is_symlink(), "linked_state_file")
+    require(not is_link(lock), "linked_state_file")
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "r+b") as handle:
         require(stat.S_ISREG(os.fstat(handle.fileno()).st_mode), "invalid_lock")
@@ -108,6 +156,91 @@ def job_lock(directory):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+class Telemetry:
+    """Best-effort private records, independent of the immutable delivery outbox."""
+    def __init__(self, root, directory, binding, command, started_at):
+        self.file, self.saved = None, False
+        self.record = {"schema": 1, "binding": binding, "client_version": VERSION, "command": command,
+                       "started_at": started_at, "state": "running", "timings": []}
+        try:
+            private_dir(root)
+            private_dir(directory)
+            target = directory / "telemetry"
+            private_dir(target)
+            with job_lock(target):
+                require(sum(1 for p in target.iterdir() if re.fullmatch(r"[a-f0-9]{32}\.json", p.name)) < TIMING_LIMIT,
+                        "timing_capacity")
+                self.file = target / (uuid.uuid4().hex + ".json")
+                self.update()
+                if not self.saved:
+                    self.file = None
+        except Exception:
+            self.file = None
+            self.saved = False
+
+    def update(self, **fields):
+        self.record.update(fields)
+        if self.file is None:
+            return
+        try:
+            private_dir(self.file.parent)
+            require(len(encode(self.record)) <= 65536, "timing_record_too_large")
+            atomic_json(self.file, self.record)
+            self.saved = True
+        except Exception:
+            self.saved = False
+
+    def finish(self, result):
+        safe = Client.summary(result.get("result", result))
+        if result.get("local_replayed") is True:
+            safe["local_replayed"] = True
+        error = result.get("error")
+        self.update(state="completed", completed_at=result["completed_at"], duration_ms=result["duration_ms"],
+                    timings=timing_rows(result["timings"]), active_request=None,
+                    result={**safe, "ok": result.get("ok") is True},
+                    error_code=error if error in TIMING_ERRORS else "other_client_error" if error else None)
+
+
+def recorded_timings(root, directory, binding, limit):
+    target, entries, invalid = directory / "telemetry", [], 0
+    if target.exists() or is_link(target):
+        for folder in (root, directory, target):
+            require(folder.is_dir() and not is_link(folder), "invalid_timing_directory")
+            if os.name != "nt":
+                require(stat.S_IMODE(folder.stat().st_mode) & 0o077 == 0, "invalid_timing_directory")
+        files = sorted(p for p in target.iterdir() if re.fullmatch(r"[a-f0-9]{32}\.json", p.name))
+        require(len(files) <= TIMING_LIMIT, "timing_capacity")
+        for file in files:
+            try:
+                require(not is_link(file) and file.is_file(), "invalid_timing_record")
+                item = read_json(file, 65536)
+                require(item.get("schema") == 1 and item.get("binding") == binding and item.get("command") in TIMING_COMMANDS
+                        and item.get("state") in ("running", "completed"), "invalid_timing_record")
+                version = item.get("client_version")
+                require(isinstance(version, str) and bool(re.fullmatch(r"\d+\.\d+\.\d+", version)), "invalid_timing_record")
+                safe = {"client_version": version, "command": item["command"], "state": item["state"],
+                        "started_at": timestamp(item.get("started_at")), "timings": timing_rows(item.get("timings"))}
+                if item["state"] == "completed":
+                    require(isinstance(item.get("result"), dict), "invalid_timing_record")
+                    safe.update(completed_at=timestamp(item.get("completed_at")), duration_ms=duration(item.get("duration_ms")),
+                                result=Client.summary(item.get("result", {})))
+                    if item["result"].get("local_replayed") is True:
+                        safe["result"]["local_replayed"] = True
+                    error = item.get("error_code")
+                    if error:
+                        safe["error_code"] = error if error in TIMING_ERRORS else "other_client_error"
+                if item.get("active_request") in HTTP_OPERATIONS:
+                    safe.update(active_request=item["active_request"], active_request_started_at=timestamp(item.get("active_request_started_at")))
+                entries.append(safe)
+            except (ClientError, OSError, ValueError, TypeError, KeyError):
+                invalid += 1
+    entries.sort(key=lambda item: item["started_at"])
+    beginnings = [item for item in entries if item["command"] == "begin"]
+    return {"ok": True, "history_read_only": True, "platform_start_known": False, "entries_total": len(entries),
+            "invalid_records": invalid, "first_recorded_client_started_at": entries[0]["started_at"] if entries else None,
+            "begin_started_at": beginnings[0]["started_at"] if beginnings else None, "entries": entries[-limit:]}
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -115,7 +248,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class Client:
     def __init__(self, args):
-        self.args, self.timings = args, []
+        self.args, self.timings, self.telemetry = args, [], None
         self.protected_paths = {Path(args.config).resolve()} if args.config else set()
         config = read_json(args.config, 16384) if args.config else {}
         require(set(config) <= {"reply_url", "reply_token_file"}, "unknown_config_field")
@@ -151,7 +284,10 @@ class Client:
         if auth:
             request_headers["X-Reply-Token"] = self.token
         request = urllib.request.Request(self.origin + path, data=body, method=method, headers=request_headers)
-        started, status = time.perf_counter(), None
+        status, started_at = None, utc_now()
+        if self.telemetry:
+            self.telemetry.update(active_request=operation, active_request_started_at=started_at)
+        started, started_at = time.perf_counter(), utc_now()
         try:
             try:
                 response = self.opener.open(request, timeout=timeout)
@@ -170,8 +306,19 @@ class Client:
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ClientError("network_error", action="inspect_task_before_retry") from None
         finally:
-            self.timings.append({"operation": operation, "http_status": status,
+            self.timings.append({"operation": operation, "http_status": status, "started_at": started_at,
                                  "duration_ms": round((time.perf_counter() - started) * 1000, 1)})
+            if self.telemetry:
+                self.telemetry.update(active_request=None, timings=list(self.timings))
+
+    def state_directories(self):
+        root = Path(self.args.state_dir) if self.args.state_dir else Path(__file__).absolute().parent / ".state"
+        self.state_root = root.resolve()
+        return root, root / self.task["job_id"]
+
+    def start_telemetry(self, started_at):
+        root, directory = self.state_directories()
+        self.telemetry = Telemetry(root, directory, self.binding, self.args.command, started_at)
 
     def load_task(self):
         require(bool(self.args.task), "task_file_required")
@@ -253,7 +400,7 @@ class Client:
         upload_id = digest(encode([item["kind"], item["name"], item["sha256"]]))
         metadata = {key: item[key] for key in ("kind", "name", "bytes", "sha256")}
         marker, expected = directory / ("upload-" + upload_id + ".json"), {"binding": self.binding, **metadata}
-        require(not marker.is_symlink(), "linked_state_file")
+        require(not is_link(marker), "linked_state_file")
         if marker.exists():
             require(read_json(marker, 2048) == expected, "invalid_upload_marker")
             status, result = self.request("upload_status", "GET", self.resource + "/uploads/" + upload_id)
@@ -306,13 +453,11 @@ class Client:
 
     def reply(self):
         require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.args.operation)), "invalid_operation")
-        state_root = Path(self.args.state_dir) if self.args.state_dir else Path(__file__).absolute().parent / ".state"
+        state_root, directory = self.state_directories()
         private_dir(state_root)
-        self.state_root = state_root.resolve()
-        directory = state_root / self.task["job_id"]
         with job_lock(directory):
             journal = directory / (self.args.operation + ".json")
-            require(not journal.is_symlink(), "linked_state_file")
+            require(not is_link(journal), "linked_state_file")
             record = read_json(journal, 9 * MIB) if journal.exists() else None
             if record:
                 require(record.get("schema") == 1 and record.get("binding") == self.binding and
@@ -407,6 +552,9 @@ def main():
     doctor = commands.add_parser("doctor", help="read-only client check; --live probes unauthenticated /health")
     doctor.add_argument("--live", action="store_true")
     commands.add_parser("status", help="read current task state")
+    commands.add_parser("begin", help="record local client entry only; no HTTP request or QQ message")
+    commands.add_parser("timings", help="read recorded client timings offline; never reconstruct old timestamps").add_argument(
+        "--limit", type=int, choices=range(1, TIMING_LIMIT + 1), default=20)
     for command in ("progress", "final"):
         sub = commands.add_parser(command)
         sub.add_argument("--operation", default=command, help="stable local operation ID; reuse for retries")
@@ -417,10 +565,14 @@ def main():
             sub.add_argument("--" + kind, action="append", default=[], help="local artifact; repeat to attach several")
     commands.add_parser("resume", help="explicitly resubmit the exact saved body after checking task state").add_argument("--operation", required=True)
     args, client = parser.parse_args(), None
-    started, started_at = time.perf_counter(), dt.datetime.now(dt.timezone.utc).isoformat()
+    started, started_at = time.perf_counter(), utc_now()
     try:
         require(sys.version_info >= (3, 10), "python_3_10_required")
         client = Client(args)
+        if args.command != "doctor" or args.task:
+            client.load_task()
+            if args.command != "timings":
+                client.start_telemetry(started_at)
         if args.command == "doctor":
             result = {"ok": client.token_available, "client_version": VERSION, "python_version": sys.version.split()[0],
                       "reply_url_configured": True, "reply_token_available": client.token_available}
@@ -432,8 +584,12 @@ def main():
                         health.get("ws_state") == "OPEN", "live_bridge_not_ready")
                 result.update(bridge_version=health.get("version"), ws_state=health.get("ws_state"))
         else:
-            client.load_task()
-            if args.command == "status":
+            if args.command == "begin":
+                result = {"ok": True, "marker": "client_entry", "platform_start_known": False}
+            elif args.command == "timings":
+                root, directory = client.state_directories()
+                result = recorded_timings(root, directory, client.binding, args.limit)
+            elif args.command == "status":
                 status = client.status()
                 result = {key: status.get(key) for key in ("ok", "delivery", "reply", "reply_closed", "next_reply_seq", "messages_remaining")}
             else:
@@ -448,7 +604,14 @@ def main():
         result, code = {"ok": False, "error": "client_error"}, 1
     result["timings"] = client.timings if client else []
     result["started_at"] = started_at
+    result["completed_at"] = utc_now()
     result["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    if client and client.telemetry:
+        try:
+            client.telemetry.finish(result)
+        except Exception:
+            client.telemetry.saved = False
+        result["telemetry_saved"] = client.telemetry.saved
     print(json.dumps(result, ensure_ascii=True))
     return code
 

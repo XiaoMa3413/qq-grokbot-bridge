@@ -68,7 +68,7 @@ async function fixture(t, type = 'c2c') {
 test('standalone client reads an explicit URL and existing token file, probes without token and reports timings', async t => {
   const f = await fixture(t);
   const result = await f.cli(['doctor', '--live']);
-  assert.equal(result.code, 0); assert.equal(result.value.client_version, '1.0.0');
+  assert.equal(result.code, 0); assert.equal(result.value.client_version, '1.1.0');
   assert.equal(result.value.bridge_version, '1.8.0'); assert.equal(result.value.reply_token_available, true);
   assert.equal(f.requests[0].path, '/health'); assert.equal(f.requests[0].token, undefined);
   assert.equal(result.value.timings[0].http_status, 200); assert.ok(result.value.timings[0].duration_ms >= 0);
@@ -179,10 +179,100 @@ test('kernel lock blocks concurrent clients and is released after a crash; a sen
   await waitFor(() => f.calls.length === 1, 'client send intent');
   assert.equal((await f.cli(['final', '--text', 'answer'])).value.error, 'client_busy');
   first.child.kill(); await first.done;
+  const requests = f.requests.length, recorded = await f.cli(['timings']);
+  const interrupted = recorded.value.entries.find(e => e.command === 'final');
+  assert.equal(interrupted.state, 'running'); assert.equal(interrupted.active_request, 'reply');
+  assert.equal(interrupted.completed_at, undefined); assert.equal(f.requests.length, requests);
   assert.equal((await f.cli(['resume', '--operation', 'final'])).value.error, 'reply_needs_review');
   f.controls.release(); await waitFor(() => f.job.reply.state === 'done', 'finished reply');
   assert.equal((await f.cli(['resume', '--operation', 'final'])).value.replayed, true);
   assert.equal(f.calls.length, 1);
+});
+
+test('client entry, HTTP timings and local replays survive stdout loss in private records', async t => {
+  const f = await fixture(t);
+  const begin = await f.cli(['begin']);
+  assert.equal(begin.value.marker, 'client_entry'); assert.equal(begin.value.platform_start_known, false);
+  assert.equal(begin.value.telemetry_saved, true); assert.equal(f.requests.length, 0); assert.equal(f.calls.length, 0);
+  assert.equal((await f.cli(['progress', '--text', 'private progress'])).value.telemetry_saved, true);
+  assert.equal((await f.cli(['final', '--text', 'private final'])).value.telemetry_saved, true);
+  const outbox = fs.readFileSync(path.join(f.state, f.job.id, 'final.json'), 'utf8');
+  assert.equal((await f.cli(['final', '--text', 'private final'])).value.local_replayed, true);
+  const requests = f.requests.length;
+  const result = await f.cli(['timings']);
+  assert.equal(result.code, 0); assert.equal(result.value.history_read_only, true);
+  assert.equal(result.value.entries_total, 4); assert.equal(result.value.platform_start_known, false);
+  assert.equal(result.value.begin_started_at, begin.value.started_at);
+  assert.equal(result.value.entries[0].command, 'begin');
+  assert.deepEqual(result.value.entries[1].timings.map(r => r.operation), ['status', 'reply']);
+  assert.equal(result.value.entries[3].result.local_replayed, true); assert.deepEqual(result.value.entries[3].timings, []);
+  assert.ok(result.value.entries.every(e => e.state === 'completed' && typeof e.duration_ms === 'number'));
+  assert.ok(result.value.entries[1].timings.every(e => typeof e.started_at === 'string'));
+  assert.equal(f.requests.length, requests); assert.equal(f.calls.length, 2);
+  assert.equal(fs.readFileSync(path.join(f.state, f.job.id, 'final.json'), 'utf8'), outbox);
+  assert.ok(!result.stdout.includes(TOKEN)); assert.ok(!result.stdout.includes('private final'));
+  for (const file of fs.readdirSync(path.join(f.state, f.job.id, 'telemetry'))) {
+    if (!file.endsWith('.json')) continue;
+    const target = path.join(f.state, f.job.id, 'telemetry', file), raw = fs.readFileSync(target, 'utf8');
+    for (const secret of [TOKEN, f.config, 'ORIGINAL', 'private progress', 'private final', 'http://127.0.0.1:']) assert.ok(!raw.includes(secret));
+    if (process.platform !== 'win32') assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+  }
+});
+
+test('timings are offline and never reconstructed from an old outbox or file timestamps', async t => {
+  const f = await fixture(t), dir = path.join(f.state, f.job.id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const legacy = JSON.stringify({ schema: 1, state: 'done', body: { content: 'legacy private reply' }, result: { ok: true } });
+  fs.writeFileSync(path.join(dir, 'final.json'), legacy);
+  fs.writeFileSync(f.task, JSON.stringify({ ...f.payload, reply_deadline: new Date(0).toISOString() }));
+  const result = await f.cli(['timings']);
+  assert.equal(result.code, 0); assert.equal(result.value.entries_total, 0);
+  assert.equal(result.value.begin_started_at, null); assert.equal(result.value.first_recorded_client_started_at, null);
+  assert.equal(f.requests.length, 0); assert.equal(fs.readFileSync(path.join(dir, 'final.json'), 'utf8'), legacy);
+  assert.equal(fs.existsSync(path.join(dir, 'telemetry')), false);
+});
+
+test('a telemetry storage failure never changes a confirmed reply into a failure or causes another send', async t => {
+  const f = await fixture(t), dir = path.join(f.state, f.job.id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(dir, 'telemetry'), 'blocked');
+  const sent = await f.cli(['final', '--text', 'answer']);
+  assert.equal(sent.code, 0); assert.equal(sent.value.ok, true); assert.equal(sent.value.telemetry_saved, false);
+  const replay = await f.cli(['final', '--text', 'answer']);
+  assert.equal(replay.code, 0); assert.equal(replay.value.local_replayed, true); assert.equal(replay.value.telemetry_saved, false);
+  assert.equal(f.calls.length, 1); assert.equal(f.requests.filter(r => r.method === 'POST').length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'final.json'))).state, 'done');
+});
+
+test('timing export ignores damaged records and strips arbitrary fields and error text', async t => {
+  const f = await fixture(t); await f.cli(['begin']);
+  const dir = path.join(f.state, f.job.id, 'telemetry'), original = JSON.parse(fs.readFileSync(path.join(dir, fs.readdirSync(dir).find(f => f.endsWith('.json')))));
+  const modified = { ...original, extra: TOKEN, result: { ok: true, secret: TOKEN }, error_code: TOKEN };
+  fs.writeFileSync(path.join(dir, 'a'.repeat(32) + '.json'), JSON.stringify(modified));
+  fs.writeFileSync(path.join(dir, 'b'.repeat(32) + '.json'), 'not JSON ' + TOKEN);
+  const result = await f.cli(['timings', '--limit', '1']);
+  assert.equal(result.code, 0); assert.equal(result.value.entries_total, 2); assert.equal(result.value.invalid_records, 1);
+  assert.equal(result.value.entries.length, 1); assert.ok(!result.stdout.includes(TOKEN));
+  assert.equal(f.requests.length, 0);
+});
+
+test('a full timing directory stops recording without blocking the task or deleting old records', async t => {
+  const f = await fixture(t), dir = path.join(f.state, f.job.id, 'telemetry');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (let i = 0; i < 128; i++) fs.writeFileSync(path.join(dir, i.toString(16).padStart(32, '0') + '.json'), '{}');
+  const result = await f.cli(['final', '--text', 'answer']);
+  assert.equal(result.code, 0); assert.equal(result.value.telemetry_saved, false); assert.equal(f.calls.length, 1);
+  assert.equal(fs.readdirSync(dir).filter(f => f.endsWith('.json')).length, 128);
+});
+
+test('linked telemetry directories are not followed and cannot interfere with confirmed replies', async t => {
+  const f = await fixture(t), dir = path.join(f.state, f.job.id), outside = path.join(f.root, 'outside');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dir, 'telemetry'), process.platform === 'win32' ? 'junction' : 'dir');
+  const result = await f.cli(['final', '--text', 'answer']);
+  assert.equal(result.code, 0); assert.equal(result.value.telemetry_saved, false); assert.equal(f.calls.length, 1);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.equal((await f.cli(['timings'])).value.error, 'invalid_timing_directory');
+  assert.deepEqual(fs.readdirSync(outside), []);
 });
 
 test('client rejects redirects, task expiry and credential mistakes without leaking proxy bodies or sending QQ', async t => {
@@ -206,6 +296,11 @@ test('cached QQ failures are reported once and never automatically resent or ass
   assert.equal((await f.cli(['final', '--text', 'answer'])).value.error, 'operation_failed_needs_review');
   assert.equal((await f.cli(['resume', '--operation', 'final'])).value.error, 'operation_failed_needs_review');
   assert.equal(f.calls.length, 1);
+  const history = await f.cli(['timings']);
+  assert.equal(history.value.entries[0].error_code, 'reply_rejected');
+  assert.equal(history.value.entries[0].result.ok, false);
+  assert.equal(history.value.entries[0].timings.at(-1).http_status, 502);
+  assert.ok(!history.stdout.includes(TOKEN)); assert.equal(f.calls.length, 1);
 });
 
 test('client text quota uses the same UTF-16 and paragraph splitting as the bridge', async () => {
