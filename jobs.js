@@ -132,7 +132,9 @@ class ForwardWorker {
       await Promise.all(eligible.slice(i, i + this.concurrency).map(job => this.dispatch(job)));
   }
   async dispatch(job) {
-    job.delivery = 'dispatching'; job.attempts++; this.store.save(job);
+    // A failed intent write must leave the live job pending for the next worker tick.
+    const next = { ...job, delivery: 'dispatching', attempts: job.attempts + 1 };
+    this.store.save(next); Object.assign(job, next);
     try {
       if (!job.prepared) {
         const prepared = await this.prepare(structuredClone(job.payload), job);

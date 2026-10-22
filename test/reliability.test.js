@@ -59,6 +59,45 @@ test('durable queue restores retries, honors Retry-After and never replays an ac
   assert.equal(restored.get(second.job.id).delivery, 'accepted');
 });
 
+test('a failed dispatch intent recovers without restart and preserves conversation order', async t => {
+  const f = setup(t), first = f.store.enqueue(payload()).job;
+  const second = f.store.enqueue(payload('m2')).job;
+  const save = f.store.save.bind(f.store), calls = [];
+  let failNextSave = true, preparations = 0;
+  f.store.save = job => {
+    if (failNextSave) {
+      failNextSave = false;
+      throw Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
+    }
+    save(job);
+  };
+  const worker = new ForwardWorker(f.store, {
+    prepare: async p => { preparations++; return p; },
+    send: async (p, job) => {
+      const persisted = JSON.parse(fs.readFileSync(path.join(f.store.dir, job.id + '.json'), 'utf8'));
+      assert.equal(persisted.delivery, 'dispatching');
+      assert.equal(persisted.attempts, 1);
+      calls.push(p.msg_id);
+      return { ok: true, status: 200 };
+    },
+  });
+  await assert.rejects(worker.runOnce(), { code: 'ENOSPC' });
+  const persisted = JSON.parse(fs.readFileSync(path.join(f.store.dir, first.id + '.json'), 'utf8'));
+  assert.equal(first.delivery, 'pending'); assert.equal(first.attempts, 0);
+  assert.equal(persisted.delivery, 'pending'); assert.equal(persisted.attempts, 0);
+  assert.equal(preparations, 0); assert.deepEqual(calls, []);
+
+  // The same worker/store must recover; restarting would hide the original bug.
+  await worker.runOnce();
+  assert.deepEqual(calls, ['m1']); assert.equal(first.attempts, 1);
+  assert.equal(second.delivery, 'pending'); assert.equal(second.attempts, 0);
+  await worker.runOnce(); assert.deepEqual(calls, ['m1']);
+  f.store.beginReply(first, 'final'); f.store.finishReply(first, 200, { ok: true });
+  await worker.runOnce();
+  assert.deepEqual(calls, ['m1', 'm2']); assert.equal(preparations, 2);
+  assert.equal(second.delivery, 'accepted');
+});
+
 test('pending jobs expire at QQ deadlines and a permanent webhook error is not retried', async t => {
   const f = setup(t);
   const group = f.store.enqueue({ type: 'group', group_openid: 'G', msg_id: 'g1', timestamp: new Date().toISOString() }).job;

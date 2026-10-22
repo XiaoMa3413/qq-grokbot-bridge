@@ -75,11 +75,11 @@ function append(type, id, entry) {
 // history as role:user entries, skipping duplicates. Each item
 // {author, content, attachments, timestamp?, msg_id?} becomes one entry; an
 // attachment carrying a local_path contributes a '[图片] <path>' content line,
-// exactly like a downloaded inbound image. A duplicate is any stored entry that
-// shares the same msg_id (when both carry one) OR the same trimmed content with
-// a compatible nickname (a null on either side matches) and a timestamp within
-// windowMs. Non-duplicates are appended in order; the newly-added count is
-// returned. History stays bounded by historyLimit through append().
+// exactly like a downloaded inbound image. Only user entries are candidates.
+// When both carry a msg_id, only equal IDs are duplicates. Otherwise, fall back
+// to the same trimmed content, a compatible nickname (null matches either),
+// and a timestamp within windowMs. Non-duplicates are appended in order; the
+// newly-added count is returned. History stays bounded through append().
 function mergeRecent(type, id, items, windowMs = 600000) {
   if (!Array.isArray(items)) return 0;
   let added = 0;
@@ -93,12 +93,12 @@ function mergeRecent(type, id, items, windowMs = 600000) {
       timestamp: item.timestamp || new Date().toISOString(), msg_id: item.msg_id || null };
     const tMs = Date.parse(entry.timestamp);
     const dup = readAll(type, id).some(e => {
+      if (e.role !== 'user') return false;
+      if (entry.msg_id != null && e.msg_id != null) return String(entry.msg_id) === String(e.msg_id);
       const eMs = Date.parse(e.timestamp);
       const within = Number.isFinite(tMs) && Number.isFinite(eMs) && Math.abs(tMs - eMs) <= windowMs;
-      const sameId = entry.msg_id != null && e.msg_id != null && String(entry.msg_id) === String(e.msg_id);
-      const sameText = String(e.content || '').trim() === entry.content.trim()
+      return String(e.content || '').trim() === entry.content.trim()
         && (e.nickname == null || entry.nickname == null || e.nickname === entry.nickname) && within;
-      return sameId || sameText;
     });
     if (!dup && append(type, id, entry)) added++;
   }
