@@ -143,6 +143,7 @@ npm run doctor -- --remote --live
 | `QQ_REPLY_URL` | **回复客户端/Grok 执行环境**的固定目标地址，不是桥接服务器的监听配置 |
 | `QQ_JOBS_DIR` | 远程任务目录，默认 `data/jobs`，禁止多个桥接进程共用 |
 | `QQ_HISTORY_DIR`、`QQ_MEMORY_DIR`、`QQ_MEDIA_DIR` | 覆盖对应数据目录 |
+| `QQ_KNOWLEDGE_DIR` | 角色与选定事实目录，默认 `data/knowledge`；本地管理命令与桥接使用同一目录 |
 | `QQ_HTTP_TIMEOUT_MS` | 出站 HTTP 超时，默认 `15000` 毫秒 |
 | `QQ_READY_TIMEOUT_MS`、`QQ_LIVENESS_MAX_AGE_MS` | 启动等待和存活检查时限，默认 `60000` / `90000` 毫秒 |
 | `QQ_DEBUG_RAW_EVENTS` | `1` 时保存调试事件；仍可能包含会话隐私 |
@@ -154,6 +155,8 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 配置在启动时读取并校验，历史存储、上下文组装和回复记录共用同一份设置；修改 `config.json` 或环境变量后需重启服务生效。
 
 ## 常用操作
+
+角色和选定长期事实可按单个私聊或群聊导入，先预览再提交，保留来源、版本与删除标记；QQ 任务只读使用固定快照。使用方法与限制见[角色与选定事实导入](deploy/knowledge-import.md)。它与现有会话 Markdown 记忆并存，不自动同步平台记忆。
 
 | 操作 | 命令 / 入口 |
 |---|---|
@@ -186,7 +189,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 
 ## 数据、测试与版本
 
-运行数据位于 `data/history/`、`data/media/`、`data/jobs/`、`memory/` 和 `logs/`；systemd 的标准输出由 journal 保存。`.env`、`reply_token` 及运行数据已被 Git 忽略，仍应限制访问并单独备份。任务默认保留至截止时间后 7 天、最多 10,000 项；媒体目前不自动清理。
+运行数据位于 `data/history/`、`data/media/`、`data/jobs/`、`data/knowledge/`、`memory/` 和 `logs/`；systemd 的标准输出由 journal 保存。`.env`、`reply_token` 及运行数据已被 Git 忽略，仍应限制访问并单独备份。任务默认保留至截止时间后 7 天、最多 10,000 项；媒体目前不自动清理。
 
 `npm test` 覆盖事件解析、历史、鉴权、图片、记忆并发、任务恢复、防重及模拟服务集成。首次部署还需通过 QQ 发送实际消息，确认 Grok 任务执行并成功回传；完整验收步骤见 [部署指南](DEPLOY_AGENT.md#7-按阶段验收)。
 
@@ -197,6 +200,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | [交给 agent 部署](DEPLOY_AGENT.md) | 完整安装、迁移和验收流程 |
 | [Grok 任务配置](deploy/grok-routine.md) | 凭据迁移及可复制的例行任务规则 |
 | [远程协议](deploy/remote-protocol.md) | 任务、图片、记忆、错误码及恢复语义 |
+| [角色与选定事实导入](deploy/knowledge-import.md) | 按会话预览/提交、来源版本、删除与任务只读快照 |
 | [Sakura FRP 部署示例](deploy/sakura-frp.md) | 通用隧道设置与连通性验证 |
 | [版本与回退](deploy/releases.md) | 发布、升级、备份和回退 |
 | [同类项目代码调研](docs/research/bridge-comparison.md) | 进度反馈、投递语义、角色和记忆设计的对照与实施建议 |

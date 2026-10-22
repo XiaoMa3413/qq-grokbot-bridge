@@ -66,6 +66,7 @@ test('real bridge process recovers a queued webhook after restart and accepts th
       QQ_FORWARD_WEBHOOK_URL: base + '/webhook', QQ_REPLY_PORT: String(replyPort), QQ_REPLY_PUBLIC_URL: 'https://bridge.example/reply',
       QQ_REPLY_TOKEN: 'integration-token-0123456789abcdef0123456789', QQ_JOBS_DIR: path.join(root, 'jobs'),
       QQ_HISTORY_DIR: path.join(root, 'history'), QQ_MEMORY_DIR: path.join(root, 'memory'), QQ_MEDIA_DIR: path.join(root, 'media'),
+      QQ_KNOWLEDGE_DIR: path.join(root, 'knowledge'),
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     children.push(child); child.stdout.on('data', c => output += c); child.stderr.on('data', c => output += c);
     return child;

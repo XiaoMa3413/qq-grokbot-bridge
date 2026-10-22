@@ -8,6 +8,7 @@ const { SeenIds, RecentImages, redact } = require('./events');
 const { createHistory } = require('./history');
 const { assembleContext, speakerId } = require('./context');
 const { memoryPath } = require('./memory');
+const { KnowledgeStore } = require('./knowledge');
 const { Watchdog } = require('./watchdog');
 const { checkLiveness, detectClockJump } = require('./liveness');
 const { JobStore, ForwardWorker } = require('./jobs');
@@ -19,6 +20,8 @@ const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
 async function start() {
 const cfg = loadConfig();
+const knowledge = new KnowledgeStore();
+knowledge.check();
 const history = createHistory({ dir: process.env.QQ_HISTORY_DIR || path.join(__dirname, 'data', 'history'), config: cfg });
 const { readAll, historyLimit, append, mergeRecent } = history;
 const queueDir = path.resolve(process.env.QQ_JOBS_DIR || path.join(__dirname, 'data', 'jobs'));
@@ -93,6 +96,7 @@ const readyWd = new Watchdog({ onFire: reason => { log('WATCHDOG', reason, 'exit
 // Attach the conversation history and the long-term memory path to a forwarded payload (before the current message is recorded), then record the current one.
 function recordInbound(p, content) {
   const id = p.type === 'group' ? p.group_openid : p.openid;
+  p.knowledge = knowledge.snapshot(p.type, id);
   p.memory_path = memoryPath(p.type, id);
   try {
     const stored = readAll(p.type, id, { strict: true });
@@ -261,4 +265,4 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   srv.close(async () => { await worker?.running; process.exit(0); });
 });
 }
-start().catch(e => { console.error('FATAL:', e.message); process.exit(['EINSTANCELOCKED', 'EJOBSTATE'].includes(e.code) ? 78 : 1); });
+start().catch(e => { console.error('FATAL:', e.message); process.exit(['EINSTANCELOCKED', 'EJOBSTATE', 'EKNOWLEDGESTATE'].includes(e.code) ? 78 : 1); });

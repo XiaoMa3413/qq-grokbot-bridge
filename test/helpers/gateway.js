@@ -79,7 +79,7 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
       QQ_APP_ID: 'MOCK', QQ_APP_SECRET: 'MOCK', QQ_API_BASE: base, QQ_TOKEN_URL: base + '/token',
       QQ_FORWARD_WEBHOOK_URL: base + '/webhook', QQ_REPLY_PORT: String(port), QQ_REPLY_PUBLIC_URL: 'https://bridge.example/reply',
       QQ_REPLY_TOKEN: TOKEN, QQ_JOBS_DIR: path.join(root, 'jobs'), QQ_HISTORY_DIR: path.join(root, 'history'),
-      QQ_MEMORY_DIR: path.join(root, 'memory'), QQ_MEDIA_DIR: path.join(root, 'media'), ...overrides,
+      QQ_MEMORY_DIR: path.join(root, 'memory'), QQ_MEDIA_DIR: path.join(root, 'media'), QQ_KNOWLEDGE_DIR: path.join(root, 'knowledge'), ...overrides,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     child.output = ''; child.url = `http://127.0.0.1:${port}`;
     child.stdout.on('data', c => child.output += c); child.stderr.on('data', c => child.output += c);

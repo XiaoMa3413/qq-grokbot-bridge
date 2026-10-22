@@ -102,6 +102,8 @@ v1.5 起额外携带 `bridge_version` 和 `context`：后者描述会话/说话�
 
 ## 读写记忆
 
+v1.6 另提供只读 `knowledge` 和 `knowledge_url`：角色与选定事实按本任务准备时的版本固定，`GET /jobs/<job_id>/knowledge` 返回 `{ok:true, knowledge}`，遵守同样的鉴权与到期约束，PUT 返回 405。旧任务没有快照时返回 404。此资源不通过下列 Markdown 写入接口更新，详见[角色与选定事实导入](knowledge-import.md)。
+
 - `GET /jobs/<job_id>/memory` → `{ok, content, etag}`，响应头也包含 `ETag`。
 - `PUT /jobs/<job_id>/memory`，正文 `{ "content": "完整的新Markdown内容" }`，请求头 `If-Match` 填最近读取的 etag。
 - 缺少 `If-Match` 返回 428；已有并发修改返回 412，需要重新读取、合并后再更新。

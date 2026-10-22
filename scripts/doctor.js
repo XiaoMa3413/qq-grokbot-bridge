@@ -3,6 +3,7 @@ const fs = require('node:fs'), path = require('node:path');
 const { loadConfig, loadReplyToken } = require('../configuration');
 const { effectiveEnvironment } = require('./config-tools');
 const { readJobs } = require('../job_state');
+const { KnowledgeStore } = require('../knowledge');
 const loopback = host => ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(host);
 function validHttp(value) {
   try {
@@ -58,7 +59,7 @@ async function diagnose({ dir = path.resolve(__dirname, '..'), env = process.env
   }
   try { loadReplyToken({ dir, env: values, create: false }); add('reply_token', 'pass', '回复密钥已配置。'); }
   catch (error) { add('reply_token', 'fail', error.code === 'ENOENT' ? '回复密钥缺失；运行 npm run setup。' : '回复密钥无法读取或不足 32 字符；检查 QQ_REPLY_TOKEN / reply_token。'); }
-  for (const [key, fallback] of [['QQ_JOBS_DIR', 'data/jobs'], ['QQ_HISTORY_DIR', 'data/history'], ['QQ_MEDIA_DIR', 'data/media'], ['QQ_MEMORY_DIR', 'memory']]) {
+  for (const [key, fallback] of [['QQ_JOBS_DIR', 'data/jobs'], ['QQ_HISTORY_DIR', 'data/history'], ['QQ_MEDIA_DIR', 'data/media'], ['QQ_MEMORY_DIR', 'memory'], ['QQ_KNOWLEDGE_DIR', 'data/knowledge']]) {
     let target = path.resolve(dir, values[key] || fallback);
     try {
       for (;;) {
@@ -73,6 +74,10 @@ async function diagnose({ dir = path.resolve(__dirname, '..'), env = process.env
       add(key, 'pass', key + ' 的目录或创建所需的父目录可访问。');
     } catch { add(key, 'fail', key + ' 不是可访问的数据目录；检查路径与读写权限。'); }
   }
+  try {
+    const count = new KnowledgeStore({ dir: path.resolve(dir, values.QQ_KNOWLEDGE_DIR || 'data/knowledge') }).check();
+    add('knowledge_state', 'pass', `角色与导入事实校验通过（${count} 个会话）；未修改文件。`);
+  } catch { add('knowledge_state', 'fail', '无法读取有效的角色与导入事实；保留原文件，核对备份和存储权限。'); }
   if (mode === 'remote') {
     try {
       const jobs = readJobs(path.resolve(dir, values.QQ_JOBS_DIR || 'data/jobs'));

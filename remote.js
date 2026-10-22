@@ -70,6 +70,7 @@ class RemoteAccess {
     result.bridge_version = require('./package.json').version;
     result.memory_url = `${this.origin}/jobs/${job.id}/memory`;
     result.memory = { content: memory.content, etag: memory.etag };
+    if (result.knowledge) result.knowledge_url = `${this.origin}/jobs/${job.id}/knowledge`;
     result.reply_deadline = new Date(job.deadline).toISOString();
     result.reply_policy = { segmented: true, next_reply_seq: repliesOf(job).length + 1,
       message_limit: messageLimit(payload.type, payload.msg_id), progress_max_chars: REPLY_LIMITS.textChars, reserve_final: REPLY_LIMITS.reserveFinal };
@@ -77,7 +78,7 @@ class RemoteAccess {
   }
   handle(req, res, send) {
     if (!req.url.startsWith('/jobs/')) return false;
-    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(memory|media)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
+    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(memory|media|knowledge)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
     if (!match) { send(404, { ok: false, error: 'not found' }); return true; }
     const job = this.store.get(match[1]);
     if (!job) { send(404, { ok: false, error: 'unknown job' }); return true; }
@@ -89,7 +90,11 @@ class RemoteAccess {
           reply_final: !!job.reply && job.reply.final !== false, reply_closed: replyClosed(job), next_reply_seq: repliesOf(job).length + 1,
           messages_used: job.sentCount || 0, messages_remaining: Math.max(0, messageLimit(job.payload.type, job.payload.msg_id) - (job.sentCount || 0)),
           replies: repliesOf(job).map(r => ({ reply_seq: r.seq || 1, final: r.final !== false, state: r.state, http_status: r.httpStatus || null })),
+          knowledge_revision: job.payload.knowledge?.revision ?? null, profile_version: job.payload.knowledge?.profile?.version || null,
           last_error: job.lastError || null, deadline: new Date(job.deadline).toISOString() });
+      } else if (match[2] === 'knowledge' && !match[3] && req.method === 'GET') {
+        if (!job.payload.knowledge) { send(404, { ok: false, error: 'knowledge snapshot unavailable for this task' }); return true; }
+        send(200, { ok: true, knowledge: job.payload.knowledge });
       } else if (match[2] === 'media' && match[3] && req.method === 'GET') {
         const file = job.assets[match[3]];
         if (!file) { send(404, { ok: false, error: 'unknown media' }); return true; }
