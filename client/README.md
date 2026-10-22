@@ -84,7 +84,7 @@ python qq_bridge.py --config private/client.json --task private/task.json resume
 
 ## 耗时与验收
 
-stdout 为一行 JSON，退出码 `0` 表示本次操作成功，非零需要检查。结果只输出发送计数、安全状态及计时，不输出收件人、正文、凭据、原始异常或代理页面。
+stdout 为一行 JSON，退出码 `0` 表示本次操作成功，非零需要检查。结果输出发送计数、安全状态及计时；`fetch-task` 另返回私有保存路径和上下文条数。不输出收件人、正文、凭据、原始异常或代理页面。
 
 - `duration_ms`：本次客户端调用的总耗时，包含本地处理。
 - `started_at`：本次调用开始的 UTC 时间，可与其他阶段记录对应。
