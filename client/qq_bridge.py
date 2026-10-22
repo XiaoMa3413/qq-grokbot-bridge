@@ -176,6 +176,7 @@ class Telemetry:
                     self.file = None
         except Exception:
             self.file = None
+            self.saved = False
 
     def update(self, **fields):
         self.record.update(fields)
