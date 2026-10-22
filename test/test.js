@@ -101,7 +101,7 @@ const fileLines = (type, id) => fs.readFileSync(historyFile(type, id), 'utf8').t
   assert.strictEqual(getHistory('c2c', 'TC')[0].content.length, 2000);
   fs.appendFileSync(historyFile('c2c', 'BR'), 'not json\n{"role":"user","content":"ok"}\n\n');
   assert.deepStrictEqual(getHistory('c2c', 'BR').map(e => e.content), ['ok']);
-  // ---- history: per-type limits from config.json (c2c 20 / trim 30, group 10 / trim 20)
+  // ---- standalone history defaults (c2c 20 / trim 30, group 10 / trim 20)
   assert.deepStrictEqual([historyLimit('c2c'), historyLimit('group'), historyLimit('other'), trimAt('c2c'), trimAt('group')], [20, 10, 20, 30, 20]);
   // ---- history: group keeps the last 10 entries, rewrites past 20 lines
   for (let i = 0; i < 61; i++) append('group', 'TR', { role: 'user', content: 'x' + i, timestamp: 't' + i });

@@ -1,4 +1,5 @@
 'use strict';
+const { CONTEXT_DEFAULTS, historyLimit } = require('./policy');
 // Deterministic context assembly; no model calls or platform-memory access.
 const stableId = value => typeof value === 'string' && value.length ? value : null;
 function speakerId(payload) {
@@ -38,7 +39,7 @@ function selectAux(input, budget, maxItems = 10) {
   return { entries, meta: { available_entries: available.length, sent_entries: entries.length,
     omitted_entries: available.length - entries.length, truncated_entries: entries.filter(e => e.content_truncated).length } };
 }
-function assembleContext(payload, stored, { maxChars = 12000, maxEntries = payload.type === 'group' ? 10 : 20, historyAvailable = true } = {}) {
+function assembleContext(payload, stored, { maxChars = CONTEXT_DEFAULTS.contextTextMaxChars, maxEntries = historyLimit(payload.type), historyAvailable = true } = {}) {
   if (!Number.isSafeInteger(maxChars) || maxChars < 0 || !Number.isSafeInteger(maxEntries) || maxEntries < 1)
     throw new Error('invalid context budget');
   const speaker = speakerId(payload);

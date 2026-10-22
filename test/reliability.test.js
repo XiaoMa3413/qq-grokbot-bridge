@@ -232,6 +232,27 @@ test('full size images are bounded without regex recursion or permissive base64 
   assert.ok(decodeImages({ images_base64: [{ data: threeMiB }, { data: threeMiB }] }).error);
 });
 
+for (const [type, cap] of [['c2c', 4], ['group', 5]]) test(`${type} advertised reply policy matches enforced limits and remaining quota`, async t => {
+  const f = setup(t), p = type === 'c2c' ? payload() : { ...payload(), type, group_openid: 'G' };
+  const job = f.store.enqueue(p).job, access = new RemoteAccess(f.store, 'https://bridge.example/reply');
+  const policy = access.payload(p, job).reply_policy;
+  assert.equal(policy.message_limit, cap);
+  let sends = 0;
+  const base = await server(t, f.store, access, { seq: new Map(), send: async () => { sends++; return { id: 'SENT' }; } });
+  const reply = (seq, final, content = 'working') => request(base, '/reply', { ...p, reply_seq: seq, final, content });
+  assert.equal((await reply(1, false, 'x'.repeat(policy.progress_max_chars + 1))).status, 400);
+  for (let seq = 1; seq <= cap - policy.reserve_final; seq++) {
+    const r = await reply(seq, false, 'x'.repeat(policy.progress_max_chars));
+    assert.equal(r.status, 200); assert.equal((await r.json()).messages_remaining, cap - seq);
+  }
+  assert.equal((await reply(cap, false)).status, 409);
+  const final = await reply(cap, true, 'done');
+  assert.equal(final.status, 200); assert.equal((await final.json()).messages_remaining, 0);
+  assert.equal(sends, cap);
+  const status = await (await request(base, `/jobs/${job.id}`, undefined, { method: 'GET' })).json();
+  assert.equal(status.messages_remaining, 0); assert.equal(status.reply_closed, true);
+});
+
 test('queue capacity, retention and corrupt-state handling are explicit', t => {
   const f = setup(t), store = new JobStore({ ...f.options, maxJobs: 1, retentionMs: 1000 });
   const job = store.enqueue(payload()).job;

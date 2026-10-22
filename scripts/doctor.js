@@ -2,6 +2,7 @@
 const fs = require('node:fs'), path = require('node:path');
 const { loadConfig, loadReplyToken } = require('../configuration');
 const { effectiveEnvironment } = require('./config-tools');
+const { readJobs } = require('../job_state');
 const loopback = host => ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(host);
 function validHttp(value) {
   try {
@@ -71,6 +72,16 @@ async function diagnose({ dir = path.resolve(__dirname, '..'), env = process.env
       fs.accessSync(target, fs.constants.R_OK | fs.constants.W_OK);
       add(key, 'pass', key + ' 的目录或创建所需的父目录可访问。');
     } catch { add(key, 'fail', key + ' 不是可访问的数据目录；检查路径与读写权限。'); }
+  }
+  if (mode === 'remote') {
+    try {
+      const jobs = readJobs(path.resolve(dir, values.QQ_JOBS_DIR || 'data/jobs'));
+      add('job_state', 'pass', `持久化任务校验通过（${jobs.length} 条）；未修改任务文件。`);
+    } catch (error) {
+      add('job_state', 'fail', error.code === 'EJOBSTATE'
+        ? `任务文件 ${error.file} 的 ${error.field} 无效；保留原文件，核对备份后修复。`
+        : '无法读取任务队列；检查目录与读取权限。');
+    }
   }
   if (process.platform !== 'win32') for (const name of ['.env', 'reply_token']) {
     try {
