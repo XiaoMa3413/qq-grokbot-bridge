@@ -12,6 +12,7 @@ QQ 每次触发 Grok 例行任务时，桥接显式提供本次消息、相关�
 | `recent_context`、`recent_images` | QQ 提供的最近群聊背景及桥接缓存的近期群图片 |
 | `memory`、`memory_url` | 桥接服务器保存的当前会话 Markdown 记忆 |
 | `context` | 选择历史时的身份、文字预算和缺失情况，不是额外的一份聊天正文 |
+| `mentions`、`group_receive` | QQ 的结构化提及列表，以及桥接查询得到的群模式与触发依据（1.10+） |
 
 桥接本身不读取 Grok 客户端聊天记录或平台记忆，也不根据机器人自述推断它具备哪些上下文。平台是否另外向例行任务注入记忆，属于其运行环境的行为。需要跨来源共享的事实应通过明确的导入流程提供；[平台概述](https://docs.x.ai/grok-bot/overview)中的记忆能力不能代替本项目的接口约定。
 
@@ -21,9 +22,21 @@ QQ 每次触发 Grok 例行任务时，桥接显式提供本次消息、相关�
 
 ## 群消息范围与发言归属
 
-QQ 群设置中的消息获取范围控制桥接能收到哪些事件或背景；桥接的 `historyLimitGroup` 则控制一次载荷最多选取多少条历史。这是两层独立限制，均设置为 10 也不意味着指向同一批消息。桥接不能凭载荷推定当前群设置，不能补齐未收到的聊天。
+QQ 群设置中的消息获取范围控制桥接能收到哪些事件或背景；桥接的 `historyLimitGroup` 则控制一次载荷最多选取多少条历史。这是两层独立限制，均设置为 10 也不意味着指向同一批消息。桥接不能仅凭消息正文推定当前群设置，不能补齐未收到的聊天。
 
-无论只收到 @ 消息、附带近期背景，还是收到普通群消息事件，都按实际字段处理。普通 `GROUP_MESSAGE_CREATE` 保存为群背景，不单独唤醒 Grok。全量事件路径有模拟测试，具体账号是否投递完整消息及身份仍需实际验证。
+从 1.10 起，桥接自动查询 [机器人群内状态](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_bot_state.get.html)，读取 `recv_msg_setting` 及本群机器人自身 `member_openid`。三种值分别为 `all`（全量）、`only_mention`（仅 @）、`mention_and_context`（@ 附带背景）。这是只读查询，接收范围仍由 QQ 群设置决定；不自动修改权限，也不要求为不同模式改服务端配置或 Grok 任务。
+
+成功结果缓存五分钟、失败一分钟，最多保存 512 个群；同群并发请求合并，全部群的查询开始间隔至少 2.1 秒。首次收到全量事件会刷新原非全量观察缓存；进退群或相关接收通知使缓存失效。缓存过期后按需查询，不在后台让 Grok 轮询。首次、过期或跨群查询可能带来额外等待，模式并非实时推送状态。
+
+[全量事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html) `GROUP_MESSAGE_CREATE` 中，只有结构化 `mentions` 的 `member_openid`（缺失时使用 `id`）明确匹配本群机器人 ID 才触发 Grok。@别人、@全体、昵称相同、`bot:true` 或正文中手写 `<@...>` 都不单独构成触发依据。最多保留前 100 个结构化提及。专用 `GROUP_AT_MESSAGE_CREATE` 仍按明确 @事件处理。已确认来自自身的群消息回声忽略，避免重复记为他人发言。
+
+接口仅对白名单机器人开放。无权限、网络失败或响应缺少可靠身份时，`group_receive.status` 为 `permission_denied` 或 `unavailable`；未知身份的全量事件只作背景，不猜测 @目标，不批量触发 Grok。专用 @事件继续工作。旧成功缓存过期后若查询失败，不继续使用过期机器人 ID。需要全量模式回复但没有接口权限时，先申请平台权限；不要删除队列、重装客户端或把每条群消息都转发来绕过。
+
+`group_receive` 记录查询的 `setting`、`status`、`source`、`queried_at`、`observed_event`、`self_identity_known` 和 `trigger`。它是本次任务的快照，此元数据不包含查询凭据或机器人群内 ID；`mentions` 仍保留 QQ 原本提供的提及身份。`trigger` 区分 `dedicated_at`、`self_mention`、`not_mentioned`、`self_identity_unavailable` 和 `self_message`；最后三类不触发模型。`/health.group_reception` 只提供缓存/查询群数和模式聚合计数，不提供群或成员 ID。
+
+普通聊天继续在桥接保存有限背景，可能下载图片，但不新增 Grok 任务。每次 @时仍按历史条数和文字预算筛选；更多背景可能增加单次处理量及服务器流量、磁盘使用，不代表整群消息逐条调用模型。普通背景保留既有尽力处理方式，不能据此声称每条都已持久化或历史永不遗漏。
+
+全量、仅 @和近期背景路径均有模拟桥接进程验证，包含只投递全量事件时的自身 @、其他目标、重复事件、查询中断与重放。真实账号的完整投递、提及字段及身份仍需实际验收；切换前已经匿名或未收到的背景不会补回作者。
 
 从桥接 1.9 起，`history`、`quoted`、`recent_context` 和 `recent_images` 每条记录增加 `source` 和 `attribution`：
 

@@ -1,7 +1,7 @@
 'use strict';
 const WebSocket = require('ws');
 const fs = require('fs'), path = require('path');
-const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, HTTP_TIMEOUT_MS, dispatcher, fetch } = require('./lib');
+const { loadConfig, log, loadReplyToken, TokenManager, QQApi, HTTP_TIMEOUT_MS, dispatcher, fetch } = require('./lib');
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
@@ -17,6 +17,7 @@ const { RemoteAccess } = require('./remote');
 const { acquireInstanceLock } = require('./instance_lock');
 const { GatewaySession } = require('./gateway_session');
 const { cleanupTemporaryUploads } = require('./outbound_store');
+const { GroupReception } = require('./group_reception');
 const VERSION = require('./package.json').version;
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
@@ -49,7 +50,7 @@ function livenessHealth() {
   const r = checkLiveness({ wsState: state, lastAliveAt, now: Date.now(), maxAgeMs: LIVENESS_MAX_AGE_MS });
   return { ok: r.ok && gatewayReady && !ingressError, version: VERSION, ws_state: wsStateName(state), last_ack_age_ms: r.ageMs,
     reason: ingressError ? 'ingress-persistence-failed' : r.reason || (gatewayReady ? '' : 'gateway-not-ready'),
-    ...(jobs ? { jobs: jobs.summary() } : {}) };
+    ...(jobs ? { jobs: jobs.summary() } : {}), group_reception: groupReception.summary() };
 }
 // If no websocket heartbeat ack arrives within the grace period, give up so the supervisor restarts us.
 // Also watch for a suspended/fast-forwarded local clock: (now - lastTick) - interval should stay small.
@@ -70,6 +71,7 @@ if (cfg.replyPublicUrl) jobs = new JobStore({ dir: queueDir });
 const remoteAccess = jobs ? new RemoteAccess(jobs, cfg.replyPublicUrl) : null;
 if (!cfg.forwardWebhookUrl) log('WARN: no forward webhook URL (QQ_FORWARD_WEBHOOK_URL / config.json); messages will only be logged');
 const tm = new TokenManager(cfg, APP_ID, SECRET), api = new QQApi(cfg, tm);
+const groupReception = new GroupReception(api, { log });
 const srv = createReplyServer(api, loadReplyToken(), livenessHealth, { remote: !!cfg.replyPublicUrl, store: jobs, access: remoteAccess, history });
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
@@ -162,38 +164,72 @@ function commitSequence(nextSession, nextSeq) {
   if (checkpoint) checkpoint.commit(nextSession, nextSeq);
   sessionId = nextSession; seq = nextSeq;
 }
-function acceptDispatch(m) {
+function acceptDispatch(m, isCurrent = () => true) {
   const nextSession = m.t === 'READY' ? m.d.session_id : sessionId;
-  let localPayload = null;
   if (m.t !== 'READY' && m.t !== 'RESUMED') {
     if (process.env.QQ_DEBUG_RAW_EVENTS === '1') {
       try { fs.appendFileSync(path.join(__dirname, 'logs', 'raw-events.jsonl'), JSON.stringify(redact({ t: m.t, d: m.d })) + '\n'); }
       catch (e) { log('raw event dump error', e.message); }
     }
-    const p = toPayload(m.t, m.d);
-    if (!p) log('unhandled event', m.t);
-    else if (jobs && !(p.type === 'group' && p.at === false)) {
-      const { job, added } = jobs.enqueue(p);
-      log(added ? 'queued' : 'dup', p.type, job.id);
-    } else localPayload = p;
+    const result = groupReception.payload(m.t, m.d);
+    return result?.then ? result.then(finish) : finish(result);
   }
-  // Persist the task first. Replaying after a failed checkpoint is safe because enqueue deduplicates.
-  if (!Number.isSafeInteger(m.s) || m.s < 0 || !nextSession) throw new Error('invalid dispatch sequence or session');
-  commitSequence(nextSession, m.t === 'READY' ? m.s : Math.max(seq ?? 0, m.s));
-  ingressError = false; pendingDispatch = null;
-  if (m.t === 'READY' || m.t === 'RESUMED') {
-    gatewayReady = true;
-    backoff = 1000; lastAliveAt = Date.now(); readyWd.disarm();
-    log(m.t); // Session identifiers stay in the private checkpoint.
+  return finish(null);
+  function finish(p) {
+    if (!isCurrent()) return; // Reconnect will replay from the last committed sequence.
+    let localPayload = null;
+    if (m.t !== 'READY' && m.t !== 'RESUMED') {
+      if (!p) log('unhandled event', m.t);
+      else if (p.group_receive?.trigger === 'self_message') { /* Do not record echoes as another speaker. */ }
+      else if (jobs && !(p.type === 'group' && p.at === false)) {
+        const { job, added } = jobs.enqueue(p);
+        log(added ? 'queued' : 'dup', p.type, job.id);
+      } else localPayload = p;
+    }
+    // Persist the task first. Replaying after a failed checkpoint is safe because enqueue deduplicates.
+    if (!Number.isSafeInteger(m.s) || m.s < 0 || !nextSession) throw new Error('invalid dispatch sequence or session');
+    commitSequence(nextSession, m.t === 'READY' ? m.s : Math.max(seq ?? 0, m.s));
+    ingressError = false; pendingDispatch = null;
+    if (m.t === 'READY' || m.t === 'RESUMED') {
+      gatewayReady = true;
+      backoff = 1000; lastAliveAt = Date.now(); readyWd.disarm();
+      log(m.t); // Session identifiers stay in the private checkpoint.
+    }
+    if (localPayload && !seen.check(localPayload.msg_id)) {
+      // Non-mention context and legacy local mode retain their best-effort behavior.
+      prepareInbound(localPayload).then(() => {
+        if (localPayload.type === 'group' && localPayload.at === false) return;
+        log('recv', localPayload.type, localPayload.msg_id); return forward(localPayload);
+      }).catch(e => log('inbound preparation error', e.code || 'EINBOUND'));
+    }
+    runWorker();
   }
-  if (localPayload && !seen.check(localPayload.msg_id)) {
-    // Non-mention context and legacy local mode retain their best-effort behavior.
-    prepareInbound(localPayload).then(() => {
-      if (localPayload.type === 'group' && localPayload.at === false) return;
-      log('recv', localPayload.type, localPayload.msg_id); return forward(localPayload);
-    }).catch(e => log('inbound preparation error', e.code || 'EINBOUND'));
-  }
-  runWorker();
+}
+const dispatchQueue = [];
+let drainingDispatches = false, activeDispatch = null, dispatchesSinceYield = 0;
+async function drainDispatches() {
+  if (drainingDispatches) return;
+  drainingDispatches = true;
+  try {
+    while (dispatchQueue.length && !shuttingDown) {
+      const { message, socket } = dispatchQueue.shift();
+      const current = () => socket === wsRef && socket.readyState === WebSocket.OPEN;
+      if (!current()) continue;
+      activeDispatch = { message, socket };
+      try {
+        const result = acceptDispatch(message, current);
+        if (result?.then) await result;
+      }
+      catch (error) { if (current()) failIngress(message, socket, error); }
+      finally { activeDispatch = null; }
+      // Background history/checkpoint writes are synchronous. Give sockets and
+      // timers an I/O turn during bursts, rather than starving HTTP and ACKs.
+      if (++dispatchesSinceYield >= 16) {
+        dispatchesSinceYield = 0;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+  } finally { drainingDispatches = false; }
 }
 function failIngress(m, ws, error) {
   ingressError = true; pendingDispatch = m; gatewayReady = false;
@@ -205,7 +241,7 @@ async function connect() {
   if (shuttingDown) return;
   try {
     if (pendingDispatch) {
-      try { acceptDispatch(pendingDispatch); }
+      try { await acceptDispatch(pendingDispatch); }
       catch (e) { log('ingress retry failed', e.code || 'EINGRESS'); schedule(); return; }
     }
     gatewayReady = false;
@@ -224,7 +260,16 @@ async function connect() {
       }
       catch { log('invalid gateway JSON; reconnecting without advancing sequence'); ws.terminate(); return; }
       if (m.op === 0) {
-        try { acceptDispatch(m); } catch (e) { failIngress(m, ws, e); }
+        // Serialize only dispatches; heartbeats continue while a mode query is pending.
+        // A bounded backlog reconnects and replays without acknowledging dropped frames.
+        if (dispatchQueue.length >= 256) {
+          // Retain the first uncommitted event so reconnect makes progress even
+          // if QQ replays a burst larger than this buffer after a cold lookup.
+          if (!pendingDispatch && activeDispatch?.socket === ws) pendingDispatch = activeDispatch.message;
+          log('dispatch backlog full; reconnecting'); ws.terminate(); return;
+        }
+        dispatchQueue.push({ message: m, socket: ws });
+        drainDispatches().catch(() => { log('dispatch drain failed'); ws.terminate(); });
         return;
       }
       try {

@@ -15,9 +15,9 @@ async function freePort() {
   const app = http.createServer(); await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
   const port = app.address().port; await new Promise(resolve => app.close(resolve)); return port;
 }
-async function fixture(t, { events = [], holdSend = false, holdResume = false, rejectResume = false, webhook } = {}) {
+async function fixture(t, { events = [], holdSend = false, holdResume = false, rejectResume = false, webhook, groupState } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-ingress-test-'));
-  const children = [], sockets = new Set(), resumes = [], heartbeats = [], deliveries = [], sends = [], uploads = [];
+  const children = [], sockets = new Set(), resumes = [], heartbeats = [], deliveries = [], sends = [], uploads = [], stateQueries = [];
   let identifies = 0, connections = 0, release, releaseResume;
   const gate = new Promise(resolve => release = resolve);
   const resumeGate = new Promise(resolve => releaseResume = resolve);
@@ -25,6 +25,11 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/token') return res.end('{"access_token":"MOCK","expires_in":7200}');
     if (req.url === '/gateway') return res.end(JSON.stringify({ url: `ws://127.0.0.1:${app.address().port}/ws` }));
+    if (/^\/v2\/groups\/[^/]+\/bot_state$/.test(req.url) && req.method === 'GET') {
+      stateQueries.push(req.url);
+      if (groupState) return groupState(req, res, stateQueries.length);
+      return res.end('{"member_openid":"SELF_BOT","recv_msg_setting":"mention_and_context"}');
+    }
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
@@ -97,7 +102,7 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
     try { const r = await fetch(child.url + '/health', { signal: AbortSignal.timeout(500) }); return { status: r.status, ...await r.json() }; }
     catch { return {}; }
   }
-  return { root, start, stop, health, resumes, heartbeats, deliveries, sends, uploads, release, releaseResume,
+  return { root, start, stop, health, resumes, heartbeats, deliveries, sends, uploads, stateQueries, release, releaseResume,
     dispatch(message) { for (const socket of sockets) if (socket.readyState === 1) socket.send(JSON.stringify(message)); },
     get identifies() { return identifies; }, get connections() { return connections; } };
 }
