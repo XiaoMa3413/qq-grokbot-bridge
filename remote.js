@@ -78,6 +78,7 @@ class RemoteAccess {
     if (result.knowledge) result.knowledge_url = `${this.origin}/jobs/${job.id}/knowledge`;
     result.reply_deadline = new Date(job.deadline).toISOString();
     result.reply_policy = { segmented: true, next_reply_seq: repliesOf(job).length + 1,
+      task_fetch: true,
       message_limit: messageLimit(payload.type, payload.msg_id), progress_max_chars: REPLY_LIMITS.textChars, reserve_final: REPLY_LIMITS.reserveFinal };
     result.reply_policy.media = { kinds: ['file', 'voice'], voice_formats: ['silk', 'wav', 'mp3', 'flac'],
       inline_max_bytes: MEDIA_LIMITS.inlineBytes, file_max_bytes: MEDIA_LIMITS.fileBytes, voice_max_bytes: MEDIA_LIMITS.voiceBytes,
@@ -87,7 +88,7 @@ class RemoteAccess {
   }
   handle(req, res, send) {
     if (!req.url.startsWith('/jobs/')) return false;
-    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(memory|media|knowledge|uploads)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
+    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(payload|memory|media|knowledge|uploads)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
     if (!match) { send(404, { ok: false, error: 'not found' }); return true; }
     const job = this.store.get(match[1]);
     if (!job) { send(404, { ok: false, error: 'unknown job' }); return true; }
@@ -99,10 +100,21 @@ class RemoteAccess {
           forward: forwardDiagnostic(job.forward),
           reply: job.reply?.state === 'done' && !replyClosed(job) ? 'awaiting_final' : job.reply?.state || 'pending', reply_http_status: job.reply?.httpStatus || null,
           reply_final: !!job.reply && job.reply.final !== false, reply_closed: replyClosed(job), next_reply_seq: repliesOf(job).length + 1,
+          task_fetch_required: job.payload.reply_policy?.task_fetch === true,
           messages_used: job.sentCount || 0, messages_remaining: Math.max(0, messageLimit(job.payload.type, job.payload.msg_id) - (job.sentCount || 0)),
           replies: repliesOf(job).map(r => ({ reply_seq: r.seq || 1, final: r.final !== false, state: r.state, http_status: r.httpStatus || null })),
           knowledge_revision: job.payload.knowledge?.revision ?? null, profile_version: job.payload.knowledge?.profile?.version || null,
           last_error: job.lastError || null, deadline: new Date(job.deadline).toISOString() });
+      } else if (match[2] === 'payload' && !match[3] && req.method === 'GET') {
+        // Return the already-persisted outgoing snapshot, not a newly assembled conversation.
+        if (!job.prepared || job.payload.job_id !== job.id) {
+          send(409, { ok: false, error: 'task snapshot not ready' }); return true;
+        }
+        const payload = JSON.stringify(job.payload);
+        if (Buffer.byteLength(payload) > 8 * 1024 * 1024) {
+          send(413, { ok: false, error: 'task snapshot too large' }); return true;
+        }
+        send(200, { ok: true, job_id: job.id, payload_json: payload, sha256: digest(payload) });
       } else if (match[2] === 'knowledge' && !match[3] && req.method === 'GET') {
         if (!job.payload.knowledge) { send(404, { ok: false, error: 'knowledge snapshot unavailable for this task' }); return true; }
         send(200, { ok: true, knowledge: job.payload.knowledge });

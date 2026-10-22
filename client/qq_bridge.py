@@ -19,14 +19,16 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MIB = 1024 * 1024
 HEX = re.compile(r"^[a-f0-9]{64}$")
-TIMING_COMMANDS = {"begin", "status", "progress", "final", "resume", "doctor"}
-HTTP_OPERATIONS = {"status", "upload_status", "upload", "reply", "health"}
+TIMING_COMMANDS = {"begin", "fetch-task", "status", "progress", "final", "resume", "doctor"}
+HTTP_OPERATIONS = {"task_fetch", "status", "upload_status", "upload", "reply", "health"}
 TIMING_ERRORS = {"network_error", "reply_rejected", "client_busy", "reply_needs_review", "task_expired",
                  "task_status_rejected", "insufficient_reply_quota", "operation_content_conflict", "invalid_outbox",
                  "operation_failed_needs_review", "reply_closed_or_failed", "invalid_json_response",
+                 "task_fetch_rejected", "task_snapshot_integrity_failed", "task_snapshot_route_mismatch",
+                 "invalid_task_snapshot", "task_snapshot_context_mismatch", "task_snapshot_changed", "verified_task_required",
                  "private_artifact_rejected", "invalid_input_or_local_io", "client_error"}
 TIMING_LIMIT = 128
 
@@ -105,12 +107,12 @@ def private_dir(directory):
         require(stat.S_IMODE(directory.stat().st_mode) & 0o077 == 0, "state_directory_not_private")
 
 
-def atomic_json(file, value):
+def atomic_bytes(file, data):
     require(not is_link(file), "linked_state_file")
     fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=file.parent)
     try:
         with os.fdopen(fd, "wb") as output:
-            output.write(encode(value))
+            output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, file)
@@ -123,6 +125,10 @@ def atomic_json(file, value):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def atomic_json(file, value):
+    atomic_bytes(file, encode(value))
 
 
 @contextlib.contextmanager
@@ -279,7 +285,7 @@ class Client:
             require(self.token_available, "missing_or_invalid_reply_token")
         self.opener = urllib.request.build_opener(NoRedirect())
 
-    def request(self, operation, method, path, body=None, headers=None, auth=True, timeout=30):
+    def request(self, operation, method, path, body=None, headers=None, auth=True, timeout=30, limit=MIB):
         request_headers = dict(headers or {})
         if auth:
             request_headers["X-Reply-Token"] = self.token
@@ -295,8 +301,8 @@ class Client:
                 response = error
             with response:
                 status = response.code
-                raw = response.read(MIB + 1)
-                require(len(raw) <= MIB, "response_too_large")
+                raw = response.read(limit + 1)
+                require(len(raw) <= limit, "response_too_large")
             try:
                 value = json.loads(raw)
             except (ValueError, UnicodeError):
@@ -343,6 +349,47 @@ class Client:
         require(deadline.tzinfo is not None, "invalid_deadline")
         require(deadline.timestamp() > time.time(), "task_expired")
 
+    def fetch_task(self):
+        root, directory = self.state_directories()
+        private_dir(root)
+        with job_lock(directory):
+            status, result = self.request("task_fetch", "GET", self.resource + "/payload", limit=16 * MIB)
+            require(status == 200 and result.get("ok") is True and result.get("job_id") == self.route["job_id"],
+                    "task_fetch_rejected")
+            raw = result.get("payload_json")
+            require(isinstance(raw, str) and isinstance(result.get("sha256"), str) and
+                    HEX.fullmatch(result["sha256"]) is not None, "invalid_task_snapshot")
+            data = raw.encode("utf-8")
+            require(len(data) <= 8 * MIB and digest(data) == result["sha256"], "task_snapshot_integrity_failed")
+            task = json.loads(raw)
+            require(isinstance(task, dict) and all(task.get(key) == value for key, value in self.route.items()),
+                    "task_snapshot_route_mismatch")
+            require(isinstance(task.get("reply_policy"), dict) and
+                    isinstance(task.get("reply_policy", {}).get("media", {}), dict), "invalid_reply_policy")
+            counts = {}
+            received_counts = {}
+            for key in ("history", "quoted", "recent_context", "recent_images"):
+                require(isinstance(task.get(key, []), list), "invalid_task_snapshot")
+                counts[key] = len(task.get(key, []))
+                received_counts[key] = len(self.task[key]) if isinstance(self.task.get(key), list) else None
+            declared = task.get("context", {}).get("history", {}).get("sent_entries")
+            require(declared is None or type(declared) is int and declared == counts["history"],
+                    "task_snapshot_context_mismatch")
+            # Retain the original received file; a separate private copy is authoritative.
+            target = directory / "task"
+            private_dir(target)
+            file = target / "payload.json"
+            require(not is_link(file), "linked_state_file")
+            if file.exists():
+                require(file.read_bytes() == data, "task_snapshot_changed")
+            else:
+                atomic_bytes(file, data)
+            require(file.read_bytes() == data, "task_snapshot_integrity_failed")
+            atomic_json(target / "receipt.json", {"schema": 1, "binding": self.binding, "sha256": digest(data)})
+            return {"ok": True, "verified": True, "task_file": str(file.absolute()),
+                    "context_counts": counts, "received_context_counts": received_counts,
+                    "received_matches_snapshot": self.task == task}
+
     def status(self):
         status, result = self.request("status", "GET", self.resource)
         if status != 200 or result.get("ok") is not True or result.get("job_id") != self.task["job_id"]:
@@ -357,6 +404,16 @@ class Client:
 
     def available(self, status, resume=False):
         self.deadline()
+        if status.get("task_fetch_required") is True:
+            root, directory = self.state_directories()
+            file, receipt = directory / "task" / "payload.json", directory / "task" / "receipt.json"
+            require(Path(self.args.task).absolute() == file.absolute() and
+                    not any(is_link(p) for p in (root, directory, directory / "task", file, receipt)) and
+                    receipt.is_file() and file.is_file(), "verified_task_required")
+            proof = read_json(receipt, 2048)
+            require(proof.get("schema") == 1 and proof.get("binding") == self.binding and
+                    file.stat().st_size <= 8 * MIB and digest(file.read_bytes()) == proof.get("sha256") and
+                    read_json(file) == self.task, "task_snapshot_integrity_failed")
         require(status.get("reply") not in ("sending", "uncertain"), "reply_needs_review")
         if not resume:
             require(status.get("reply_closed") is False and status.get("reply_http_status") in (None, 200),
@@ -553,6 +610,7 @@ def main():
     doctor.add_argument("--live", action="store_true")
     commands.add_parser("status", help="read current task state")
     commands.add_parser("begin", help="record local client entry only; no HTTP request or QQ message")
+    commands.add_parser("fetch-task", help="download and verify the persisted task; retain the original received file")
     commands.add_parser("timings", help="read recorded client timings offline; never reconstruct old timestamps").add_argument(
         "--limit", type=int, choices=range(1, TIMING_LIMIT + 1), default=20)
     for command in ("progress", "final"):
@@ -586,6 +644,8 @@ def main():
         else:
             if args.command == "begin":
                 result = {"ok": True, "marker": "client_entry", "platform_start_known": False}
+            elif args.command == "fetch-task":
+                result = client.fetch_task()
             elif args.command == "timings":
                 root, directory = client.state_directories()
                 result = recorded_timings(root, directory, client.binding, args.limit)

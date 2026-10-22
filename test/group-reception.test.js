@@ -93,9 +93,17 @@ test('real full-only events store background with authors and wake Grok only for
   assert.equal(p.history.length, 5); assert.ok(p.history.every(e => e.attribution.speaker === 'other'));
   assert.ok(!p.history.some(e => e.msg_id === 'ECHO'));
   assert.equal(p.history.find(e => e.msg_id === 'OTHER-BOT').attribution.is_bot, true);
+  assert.equal(p.reply_policy.task_fetch, true);
+  const snapshotUrl = child.url + '/jobs/' + p.job_id + '/payload';
+  assert.equal((await fetch(snapshotUrl)).status, 401);
+  const snapshot = await (await fetch(snapshotUrl, { headers: { 'X-Reply-Token': TOKEN } })).json();
+  assert.equal(snapshot.ok, true); assert.deepEqual(JSON.parse(snapshot.payload_json), p);
+  assert.equal(snapshot.sha256, require('node:crypto').createHash('sha256').update(snapshot.payload_json).digest('hex'));
   const r = await fetch(child.url + '/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Reply-Token': TOKEN },
     body: JSON.stringify({ type: p.type, group_openid: p.group_openid, job_id: p.job_id, msg_id: p.msg_id, content: 'answer' }) });
   assert.equal(r.status, 200); await r.json(); assert.equal(f.sends.length, 1);
+  const afterReply = await (await fetch(snapshotUrl, { headers: { 'X-Reply-Token': TOKEN } })).json();
+  assert.deepEqual(afterReply, snapshot, 'reply processing never rebuilds the frozen outgoing context');
 });
 
 test('mode lookup preserves heartbeat handling and replay after a crash before classification', { timeout: 15000 }, async t => {

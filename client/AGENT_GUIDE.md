@@ -1,6 +1,6 @@
 # QQ 任务客户端调用说明
 
-适用于已由操作者安装并检查的 `qq_bridge.py` 1.1.0 与桥接 1.8+。本说明只封装工具调用，不替代现有角色、上下文、记忆、知识、权限及回复时限规则。没有本次任务能力声明时，不假设支持新媒体。
+适用于已由操作者安装并检查的 `qq_bridge.py` 1.2.0。原回复功能兼容桥接 1.8+，完整任务下载要求桥接 1.11+。本说明只封装工具调用，不替代现有角色、上下文、记忆、知识、权限及回复时限规则。没有本次任务能力声明时，不假设支持新媒体。
 
 ## 准备
 
@@ -10,12 +10,17 @@
 
 ```bash
 python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任务.json> begin
-python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任务.json> status
-python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任务.json> progress --text '好的，我这就给你找。'
-python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任务.json> final --text-file <UTF-8答案.txt>
+python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任务.json> fetch-task
+# 检查成功结果，读取返回的 task_file 全文，后续使用该文件：
+python <客户端>/qq_bridge.py --config <私有配置.json> --task <返回的task_file> progress --text '好的，我这就给你找。'
+python <客户端>/qq_bridge.py --config <私有配置.json> --task <返回的task_file> final --text-file <UTF-8答案.txt>
 ```
 
 收到新任务后，第一项任务操作是安全保存原 JSON 并立即调用 `begin`；尽量在同一次终端工具调用里完成，不先搜索、生成文件或整理答案。`begin` 只写本地入口标记，不联网、不发 QQ、不占配额，不能声称这个时刻就是平台开工时间。不要为旧任务补跑标记。
+
+桥接 1.11+ 紧接着调用 `fetch-task`，通过操作者配置的固定地址下载并校验已落盘的完整任务。成功后必须读取返回的 `task_file` 全文，并将后续命令的 `--task` 切换到该文件。原收到文件保留用于对照，不能用摘要或手拼 JSON 覆盖它。`received_matches_snapshot:false` 表示原收到文件与服务器快照不同，不单独证明平台截断；以已验证快照作答。`context_counts` 报告快照数组条数，不表示你已经读取正文。
+
+下载只读、不发 QQ、不增加模型任务、不延长截止时间。失败时停止基于不完整上下文作答并向操作者报告；不要重放 webhook、删状态或改用裸请求绕过。旧桥接未支持此接口时，保留经操作者确认的原流程，不自动循环探测。新版任务出现 `verified_task_required` 时须使用成功下载的 `task_file`，不能删除能力声明来规避。
 
 `progress/final` 自带状态检查，通常不必额外先调用一次 `status` 或 `doctor`。短问题直接 `final`；耗时任务先成功发送一次 `progress` 再实际工作。默认操作 ID 分别为 `progress/final`；额外进度须明确另一个稳定 ID，不在重试时换 ID。命令参数通过工具的参数数组或正确的 shell 引用传递；长答案用文件，避免引号导致命令被解释。
 
@@ -28,6 +33,8 @@ python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任�
 ## 发言归属
 
 桥接 1.9+ 的上下文用 `source` / `attribution` 标注发言归属。只有 `history` 中 `source:bridge_reply`、`speaker:self`、`basis:bridge_reply_history` 能支持“我之前说过”；其他机器人、引用或未知背景中的第一人称不能认作自己。`role:user` 不保证作者是人，`is_bot:true` 不保证是本机器人。缺少身份保留未知，昵称不用于合并用户。旧载荷中的桥接 `role:bot` 历史仍可使用，但近期背景不作自身发言证据。群记忆写入主体 ID（缺失则未知）和实际消息来源，记忆及选定资料不单独作为自身发言证据，不凭猜测改写旧记忆。详见 [上下文协议](../deploy/conversation-context.md)。
+
+逐项检查已验证任务的 `history`、`quoted`、`recent_context` 及相关图片背景；`recent_context` 为空不表示没有群历史。以本次实际记录为依据，不沿用先前回答中“未收到”的推断。有稳定作者身份的外部记录与当前 `context.speaker.id` 不同时，应保留为其他成员；未见记录只能说当前可见记录缺失。
 
 ## 结果与异常
 
