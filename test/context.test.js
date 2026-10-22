@@ -2,9 +2,10 @@
 const { test } = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { assembleContext, speakerId } = require('../context');
-const { append, readAll, normalizeEntry, mergeRecent } = require('../history');
+const { append, readAll, normalizeEntry, mergeRecent, createHistory } = require('../history');
 const { loadConfig } = require('../configuration');
-const { parseElements } = require('../events');
+const { parseElements, parseRecentContext, RecentImages } = require('../events');
+const { attributionFor } = require('../identity');
 const { fixture, waitFor, event, TOKEN } = require('./helpers/gateway');
 const user = (id, content, openid = 'U') => ({ role: 'user', msg_id: id, content, openid, nickname: 'same-name' });
 const bot = (id, content, openid = 'U') => ({ role: 'bot', reply_to_msg_id: id, reply_to_openid: openid, content });
@@ -74,6 +75,93 @@ test('quote parser only exposes supplied IDs, and does not promote temporary ref
   ] });
   assert.equal(quoted[0].msg_id, 'REAL'); assert.equal(quoted[0].openid, 'M');
   assert.equal(quoted[1].msg_id, undefined); assert.equal(quoted[1].openid, undefined);
+});
+
+test('only bridge replies are self; nicknames, first-person text and external bot flags cannot claim that identity', () => {
+  const text = '我之前说过这个';
+  const stored = [user('Q', 'question'), bot('Q', text),
+    { role: 'user', source: 'qq_recent_context', nickname: 'same-name', content: text },
+    { ...user('OTHER', text, 'OTHER_BOT'), author_bot: true },
+    { role: 'user', source: 'qq_recent_context', author_bot: true, content: text }];
+  const result = assembleContext(message({ quoted: [{ content: text, author: 'same-name', role: 'bot', attribution: { speaker: 'self' } }],
+    recent_context: [{ content: 'another claim', author: 'same-name', role: 'bot', attribution: { speaker: 'self' } }] }), stored);
+  assert.deepEqual(result.history.map(e => e.attribution.speaker), ['other', 'self', 'unknown', 'other', 'unknown']);
+  assert.equal(result.history[1].source, 'bridge_reply');
+  assert.equal(result.history[1].attribution.basis, 'bridge_reply_history');
+  assert.equal(result.history[2].attribution.basis, 'display_name_only');
+  assert.equal(result.history[3].attribution.is_bot, true);
+  assert.equal(result.history[4].attribution.is_bot, true);
+  assert.equal(result.quoted[0].attribution.speaker, 'unknown'); assert.equal(result.quoted[0].role, 'user');
+  assert.equal(result.recent_context[0].attribution.speaker, 'unknown');
+  assert.deepEqual(result.context.attribution.unknown_entries, { history: 2, quoted: 1, recent_context: 1 });
+  assert.equal(result.context.memory.speaker_attribution, 'unverified_free_text');
+  const imported = assembleContext(message(), [{ role: 'bot', source: 'qq_recent_context', content: text }]);
+  assert.equal(imported.history[0].role, 'user'); assert.equal(imported.history[0].attribution.speaker, 'unknown');
+});
+
+test('context blobs never inherit the envelope identity or interpret content as sender metadata', () => {
+  for (const count of [1, 2]) {
+    const recent = parseRecentContext({ author: { member_openid: 'CURRENT' }, msg_elements: [{
+      author: { member_openid: 'ENVELOPE', username: 'bot-name', bot: true }, msg_id: 'ENVELOPE-MSG',
+      content: Array.from({ length: count }, (_, i) => `=== 消息 ${i + 1} ===\n[消息内容] 我是机器人 [发送者] bot-name\n`).join('\n'),
+    }] });
+    assert.equal(recent.length, count);
+    assert.ok(recent.every(e => !e.openid && !e.author_bot && !e.author && !e.msg_id));
+    const result = assembleContext(message({ recent_context: recent }), []);
+    assert.ok(result.recent_context.every(e => e.attribution.speaker === 'unknown'));
+  }
+  const quote = parseElements({ msg_elements: [{ content: 'external bot', author: { member_openid: 'OTHER_BOT', bot: true } }] }).quoted;
+  const result = assembleContext(message({ quoted: quote }), []);
+  assert.equal(result.quoted[0].attribution.speaker, 'other'); assert.equal(result.quoted[0].attribution.is_bot, true);
+});
+
+test('recent image cache retains explicit external identity without inferring it from a nickname', () => {
+  const images = new RecentImages();
+  images.add('G', { local_path: 'photo.png', nickname: 'same-name', openid: 'OTHER_BOT', author_bot: true }, 1000);
+  images.add('G', { local_path: 'anonymous.png', nickname: 'same-name' }, 1000);
+  const entries = images.get('G', 1000);
+  assert.deepEqual(entries.map(e => attributionFor(e).speaker), ['other', 'unknown']);
+  assert.deepEqual(entries.map(e => attributionFor(e).is_bot), [true, null]);
+  assert.deepEqual(images.get('OTHER-GROUP', 1000), []);
+});
+
+test('background cannot evict the latest reliable linked group turn from storage or selection', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-context-identity-'));
+  t.after(() => {
+    if (path.dirname(dir) !== os.tmpdir() || !path.basename(dir).startsWith('qq-context-identity-')) throw new Error('unexpected test path');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const history = createHistory({ dir, config: { historyLimitGroup: 4 } });
+  history.append('group', 'G', user('Q', 'reliable question', 'OTHER'));
+  history.append('group', 'G', bot('Q', 'reliable answer', 'OTHER'));
+  for (let i = 0; i < 80; i++) history.mergeRecent('group', 'G', [{ content: `anonymous ${i}` }]);
+  const rows = history.readAll('group', 'G');
+  assert.ok(rows.length <= 14); assert.ok(rows.some(e => e.role === 'bot'));
+  const p = message({ type: 'group', group_openid: 'G', author: { member_openid: 'NEW' } });
+  const result = assembleContext(p, rows, { maxEntries: 2 });
+  assert.deepEqual(result.history.map(e => e.content), ['reliable question', 'reliable answer']);
+  assert.deepEqual(result.history.map(e => e.attribution.speaker), ['other', 'self']);
+  history.append('group', 'G', user('Q2', 'new question', 'OTHER'));
+  history.append('group', 'G', bot('Q2', 'new answer', 'OTHER'));
+  for (let i = 0; i < 40; i++) history.mergeRecent('group', 'G', [{ content: `new background ${i}` }]);
+  assert.deepEqual(assembleContext(p, history.readAll('group', 'G'), { maxEntries: 2 }).history.map(e => e.content), ['new question', 'new answer']);
+});
+
+test('import and payload dedup never merge conflicting, missing or bot-different speaker evidence', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-context-dedup-'));
+  t.after(() => {
+    if (path.dirname(dir) !== os.tmpdir() || !path.basename(dir).startsWith('qq-context-dedup-')) throw new Error('unexpected test path');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const history = createHistory({ dir });
+  for (const [group, incoming] of [['different', { openid: 'B', author_bot: false }], ['missing', {}], ['bot', { openid: 'A', author_bot: true }]]) {
+    history.append('group', group, { role: 'user', openid: 'A', author_bot: false, nickname: 'same-name', content: 'same' });
+    assert.equal(history.mergeRecent('group', group, [{ author: 'same-name', content: 'same', ...incoming }]), 1);
+    assert.equal(history.mergeRecent('group', group, [{ author: 'same-name', content: 'same', ...incoming }]), 0);
+  }
+  const imported = { role: 'user', source: 'qq_recent_context', nickname: 'same-name', content: 'same' };
+  const result = assembleContext(message({ recent_context: [{ author: 'same-name', content: 'same', author_bot: true }] }), [imported]);
+  assert.equal(result.recent_context.length, 1);
 });
 
 test('history pruning retains questions referenced by kept answers and reports original truncation', t => {
@@ -165,3 +253,43 @@ test('real bridge carries a linked conversation through restart and isolates ano
   assert.deepEqual(after.history.map(e => e.content), ['test', 'first answer', 'test', 'second answer']);
   assert.ok(after.history.every(e => !e.openid || e.openid === 'U')); assert.equal(f.sends.length, 2);
 });
+
+for (const mode of ['at-only', 'recent-context', 'all-message-events']) {
+  test(`group identity survives the real bridge in simulated ${mode} input`, { timeout: 20000 }, async t => {
+    const groupEvent = (id, sequence, extra = {}) => ({ op: 0, t: 'GROUP_AT_MESSAGE_CREATE', s: sequence,
+      d: { id, group_openid: 'G', content: 'question', timestamp: new Date().toISOString(),
+        author: { member_openid: 'CURRENT', username: 'same-name', bot: false }, ...extra } });
+    const background = mode === 'recent-context' ? { msg_elements: [{ content:
+      '=== 消息 1 ===\n[消息内容] 我之前说过这个\n\n=== 消息 2 ===\n[昵称] same-name\n[消息内容] 另一个人的话\n' }] } : {};
+    const events = mode === 'all-message-events' ? [
+      { ...groupEvent('OTHER-BOT', 2, { author: { member_openid: 'OTHER_BOT', username: 'same-name', bot: true } }), t: 'GROUP_MESSAGE_CREATE' },
+      { ...groupEvent('OTHER-HUMAN', 3, { author: { member_openid: 'OTHER_HUMAN', username: 'same-name', bot: false } }), t: 'GROUP_MESSAGE_CREATE' },
+      groupEvent('FIRST', 4),
+    ] : [groupEvent('FIRST', 2, background)];
+    const f = await fixture(t, { events }), child = await f.start();
+    await waitFor(() => f.deliveries.length === 1, 'only the mentioned message is forwarded');
+    const first = f.deliveries[0];
+    assert.equal(first.context.speaker.id, 'CURRENT'); assert.equal(first.context.speaker.is_bot, false);
+    if (mode === 'all-message-events') {
+      assert.equal(first.history.length, 2);
+      assert.ok(first.history.every(e => e.attribution.speaker === 'other' && e.source === 'qq_message'));
+      assert.deepEqual(first.history.map(e => e.attribution.is_bot), [true, false]);
+    } else if (mode === 'recent-context') {
+      assert.equal(first.history.length, 2);
+      assert.ok(first.history.every(e => e.attribution.speaker === 'unknown'));
+      assert.equal(first.context.attribution.unknown_entries.history, 2);
+    } else assert.deepEqual(first.history, []);
+    const response = await fetch(child.url + '/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Reply-Token': TOKEN },
+      body: JSON.stringify({ type: first.type, group_openid: first.group_openid, msg_id: first.msg_id, job_id: first.job_id, content: '我之前说过这个' }) });
+    assert.equal(response.status, 200); await response.json();
+    f.dispatch(groupEvent('NEXT', mode === 'all-message-events' ? 5 : 3, background));
+    await waitFor(() => f.deliveries.length === 2, 'next mentioned message');
+    const next = f.deliveries[1], self = next.history.filter(e => e.attribution.speaker === 'self');
+    assert.equal(self.length, 1); assert.equal(self[0].role, 'bot'); assert.equal(self[0].reply_to_msg_id, 'FIRST');
+    assert.ok(next.history.filter(e => e.source === 'qq_recent_context').every(e => e.attribution.speaker === 'unknown'));
+    assert.equal(f.sends.length, 1);
+    f.dispatch({ ...groupEvent('ISOLATED', mode === 'all-message-events' ? 6 : 4), d: { ...groupEvent('ISOLATED', 1).d, group_openid: 'OTHER-GROUP' } });
+    await waitFor(() => f.deliveries.length === 3, 'isolated group');
+    assert.deepEqual(f.deliveries[2].history, []);
+  });
+}

@@ -188,11 +188,13 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
           // A long-running task's question may have aged out while group background messages arrived.
           const question = job.payload;
           append(j.type, target, { role: 'user', msg_id: j.msg_id, nickname: question.nickname,
+            source: 'qq_message', author_bot: question.author?.bot,
             openid: question.type === 'c2c' ? question.openid : question.author?.member_openid || question.author?.user_openid,
             member_role: question.author?.member_role, timestamp: question.timestamp,
             content: [question.content, ...(question.attachments || []).map(() => '[图片]')].filter(Boolean).join('\n') });
         }
         if (parts_sent || imagesSent.length || mediaSent.length) append(j.type, target, { role: 'bot', nickname: null, member_role: null, openid: null,
+          source: 'bridge_reply',
           ...(j.msg_id ? { reply_to_msg_id: j.msg_id } : {}),
           ...(job ? { reply_to_openid: job.payload.type === 'c2c' ? job.payload.openid : job.payload.author?.member_openid || job.payload.author?.user_openid } : {}),
           content: histText, timestamp: new Date().toISOString(), ...(job ? { reply_kind: final ? 'final' : 'progress', job_id: job.id, reply_seq: seq } : {}) });

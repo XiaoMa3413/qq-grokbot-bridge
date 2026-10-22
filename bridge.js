@@ -7,6 +7,7 @@ const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
 const { createHistory } = require('./history');
 const { assembleContext, speakerId } = require('./context');
+const { attributionFor } = require('./identity');
 const { memoryPath } = require('./memory');
 const { KnowledgeStore } = require('./knowledge');
 const { Watchdog } = require('./watchdog');
@@ -106,6 +107,7 @@ function recordInbound(p, content) {
     const stored = readAll(p.type, id, { strict: true });
     Object.assign(p, assembleContext(p, stored, { maxChars: cfg.contextTextMaxChars, maxEntries: historyLimit(p.type) }));
     if (!stored.some(entry => entry.msg_id === p.msg_id)) append(p.type, id, { role: 'user', nickname: p.nickname, member_role: p.author && p.author.member_role,
+      source: 'qq_message', author_bot: p.author?.bot,
       openid: speakerId(p), msg_id: p.msg_id,
       content: content ?? p.content, timestamp: p.timestamp || new Date().toISOString() });
   } catch (e) {
@@ -141,13 +143,15 @@ async function prepareInbound(p) {
   const imgs = p.attachments.filter(a => a && a.local_path).map(a => a.local_path);
   const histContent = [p.content, ...imgs.map(x => '[图片] ' + (remoteAccess ? path.basename(x) : x))].filter(Boolean).join('\n');
   if (p.type === 'group' && p.at === false) {
-    for (const x of imgs) recent.add(p.group_openid, { local_path: x, nickname: p.nickname, timestamp: p.timestamp });
+    for (const x of imgs) recent.add(p.group_openid, { local_path: x, nickname: p.nickname, timestamp: p.timestamp,
+      openid: speakerId(p), author_bot: p.author?.bot });
     append('group', p.group_openid, { role: 'user', nickname: p.nickname, member_role: p.author.member_role,
+      source: 'qq_message', author_bot: p.author?.bot,
       openid: speakerId(p), msg_id: p.msg_id, content: histContent, timestamp: p.timestamp || new Date().toISOString() });
     log('recv group-nonat', p.msg_id); return;
   }
   if (p.type === 'group') {
-    p.recent_images = recent.get(p.group_openid);
+    p.recent_images = recent.get(p.group_openid).map(e => ({ ...e, source: 'qq_recent_image', attribution: attributionFor(e) }));
     if (p.recent_context.length) mergeRecent('group', p.group_openid, p.recent_context);
   }
   recordInbound(p, histContent);

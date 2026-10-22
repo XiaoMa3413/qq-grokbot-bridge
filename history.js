@@ -4,6 +4,7 @@ const DEFAULT_DIR = path.join(__dirname, 'data', 'history');
 const MAX_CONTENT = 2000;
 const { contextSettings } = require('./configuration');
 const { historyLimit: configuredHistoryLimit } = require('./policy');
+const { stableId, isSelfReply } = require('./identity');
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 function sanitize(s, max) { return String(s == null ? '' : s).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, max); }
 function historyKey(type, id) {
@@ -21,7 +22,8 @@ function normalizeEntry(e) {
   if (x.id != null && x.id !== '') out.id = prim(x.id); // optional; only present when the source carries one
   if (x.msg_id != null && x.msg_id !== '') out.msg_id = prim(x.msg_id); // optional; only present when the source carries one
   for (const key of ['reply_to_msg_id', 'reply_to_openid']) if (typeof x[key] === 'string' && x[key]) out[key] = x[key];
-  if (x.source === 'qq_recent_context') out.source = x.source;
+  if (['qq_recent_context', 'qq_message', 'bridge_reply'].includes(x.source)) out.source = x.source;
+  if (typeof x.author_bot === 'boolean') out.author_bot = x.author_bot;
   const originalLength = Math.max(String(x.content ?? '').length, Number.isSafeInteger(x.original_content_chars) ? x.original_content_chars : 0);
   if (originalLength > out.content.length || x.content_truncated === true) {
     out.content_truncated = true; out.original_content_chars = originalLength;
@@ -59,6 +61,16 @@ function createHistory({ dir, config = {} } = {}) {
       if (lines.length > trim) {
         const keep = new Set([...lines.filter(x => x.reply_kind !== 'progress').slice(-limit),
           ...lines.filter(x => x.reply_kind === 'progress').slice(-5)]);
+        // Keep one reliable group turn even when anonymous background fills the window.
+        if (type === 'group') {
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const answer = lines[i];
+            if (!isSelfReply(answer) || answer.reply_kind === 'progress' || !stableId(answer.reply_to_msg_id)) continue;
+            const question = lines.slice(0, i).find(x => x.role !== 'bot' && x.msg_id === answer.reply_to_msg_id
+              && (!stableId(answer.reply_to_openid) || !stableId(x.openid) || answer.reply_to_openid === x.openid));
+            if (question) { keep.add(question); keep.add(answer); break; }
+          }
+        }
         const questions = new Set([...keep].filter(x => x.role === 'bot').map(x => x.reply_to_msg_id).filter(Boolean));
         for (const line of lines) if (line.role === 'user' && questions.has(line.msg_id)) keep.add(line);
         fs.writeFileSync(f, lines.filter(x => keep.has(x)).map(x => JSON.stringify(x)).join('\n') + '\n');
@@ -73,7 +85,8 @@ function createHistory({ dir, config = {} } = {}) {
   // exactly like a downloaded inbound image. Only user entries are candidates.
   // When both carry a msg_id, only equal IDs are duplicates. Otherwise, fall back
   // to the same trimmed content, a compatible nickname (null matches either),
-  // and a timestamp within windowMs. Non-duplicates are appended in order; the
+  // and a timestamp within windowMs. Identity and bot evidence must also agree.
+  // Non-duplicates are appended in order; the
   // newly-added count is returned. History stays bounded through append().
   function mergeRecent(type, id, items, windowMs = 600000) {
     if (!Array.isArray(items)) return 0;
@@ -85,10 +98,14 @@ function createHistory({ dir, config = {} } = {}) {
       for (const a of attachments) if (a && a.local_path) lines.push('[图片] ' + a.local_path);
       const entry = {
         role: 'user', nickname: item.author || null, content: lines.join('\n'), source: 'qq_recent_context',
+        openid: stableId(item.openid), ...(typeof item.author_bot === 'boolean' ? { author_bot: item.author_bot } : {}),
         timestamp: item.timestamp || new Date().toISOString(), msg_id: item.msg_id || null };
       const tMs = Date.parse(entry.timestamp);
       const dup = readAll(type, id).some(e => {
         if (e.role !== 'user') return false;
+        // Text/nicknames must not erase a known or conflicting identity.
+        if (stableId(e.openid) !== entry.openid
+          || (typeof e.author_bot === 'boolean' ? e.author_bot : null) !== (typeof entry.author_bot === 'boolean' ? entry.author_bot : null)) return false;
         if (entry.msg_id != null && e.msg_id != null) return String(entry.msg_id) === String(e.msg_id);
         const eMs = Date.parse(e.timestamp);
         const within = Number.isFinite(tMs) && Number.isFinite(eMs) && Math.abs(tMs - eMs) <= windowMs;

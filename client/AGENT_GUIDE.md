@@ -25,6 +25,10 @@ python <客户端>/qq_bridge.py --config <私有配置.json> --task <本次任�
 
 语音只接受真实且格式匹配的 SILK/WAV/MP3/FLAC；工具不做 TTS/转码，不默认启用付费服务。QQ 权限与播放效果仍以真实收件结果为准。
 
+## 发言归属
+
+桥接 1.9+ 的上下文用 `source` / `attribution` 标注发言归属。只有 `history` 中 `source:bridge_reply`、`speaker:self`、`basis:bridge_reply_history` 能支持“我之前说过”；其他机器人、引用或未知背景中的第一人称不能认作自己。`role:user` 不保证作者是人，`is_bot:true` 不保证是本机器人。缺少身份保留未知，昵称不用于合并用户。旧载荷中的桥接 `role:bot` 历史仍可使用，但近期背景不作自身发言证据。群记忆写入主体 ID（缺失则未知）和实际消息来源，记忆及选定资料不单独作为自身发言证据，不凭猜测改写旧记忆。详见 [上下文协议](../deploy/conversation-context.md)。
+
 ## 结果与异常
 
 - 同时检查退出码和 JSON `ok`，并核对附件发送计数。计时仅代表工具执行，不能当作整次任务的耗时。
