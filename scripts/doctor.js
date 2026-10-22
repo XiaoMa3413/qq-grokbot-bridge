@@ -4,6 +4,7 @@ const { loadConfig, loadReplyToken } = require('../configuration');
 const { effectiveEnvironment } = require('./config-tools');
 const { readJobs } = require('../job_state');
 const { KnowledgeStore } = require('../knowledge');
+const { checkOutboundStorage } = require('../outbound_store');
 const loopback = host => ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(host);
 function validHttp(value) {
   try {
@@ -79,6 +80,10 @@ async function diagnose({ dir = path.resolve(__dirname, '..'), env = process.env
     add('knowledge_state', 'pass', `角色与导入事实校验通过（${count} 个会话）；未修改文件。`);
   } catch { add('knowledge_state', 'fail', '无法读取有效的角色与导入事实；保留原文件，核对备份和存储权限。'); }
   if (mode === 'remote') {
+    try {
+      checkOutboundStorage(path.resolve(dir, values.QQ_JOBS_DIR || 'data/jobs'));
+      add('outbound_storage', 'pass', '文件与语音上传目录可用或尚未创建；未修改文件。');
+    } catch { add('outbound_storage', 'fail', '文件与语音上传目录无效；检查权限，禁止将其替换为符号链接。'); }
     try {
       const jobs = readJobs(path.resolve(dir, values.QQ_JOBS_DIR || 'data/jobs'));
       add('job_state', 'pass', `持久化任务校验通过（${jobs.length} 条）；未修改任务文件。`);

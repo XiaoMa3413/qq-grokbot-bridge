@@ -1,6 +1,6 @@
 {
   "name": "qq-bridge",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "",
   "main": "bridge.js",
   "engines": {
@@ -18,7 +18,8 @@
     "status": "node --env-file-if-exists=.env scripts/status.js",
     "knowledge": "node --env-file-if-exists=.env scripts/knowledge.js",
     "jobs": "node --env-file-if-exists=.env scripts/jobs.js",
-    "test": "node test/test.js && node --test test/remote.test.js test/reliability.test.js test/bridge.integration.test.js test/ingress.integration.test.js test/config-tools.test.js test/segments.test.js test/context.test.js test/job-state.test.js test/configuration.test.js test/knowledge.test.js test/forwarding.test.js"
+    "upload-media": "node --env-file-if-exists=.env scripts/upload-media.js",
+    "test": "node test/test.js && node --test test/remote.test.js test/reliability.test.js test/bridge.integration.test.js test/ingress.integration.test.js test/config-tools.test.js test/segments.test.js test/context.test.js test/job-state.test.js test/configuration.test.js test/knowledge.test.js test/forwarding.test.js test/outbound.test.js"
   },
   "keywords": [],
   "author": "",

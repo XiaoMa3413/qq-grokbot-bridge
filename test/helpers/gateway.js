@@ -17,7 +17,7 @@ async function freePort() {
 }
 async function fixture(t, { events = [], holdSend = false, holdResume = false, rejectResume = false, webhook } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-ingress-test-'));
-  const children = [], sockets = new Set(), resumes = [], heartbeats = [], deliveries = [], sends = [];
+  const children = [], sockets = new Set(), resumes = [], heartbeats = [], deliveries = [], sends = [], uploads = [];
   let identifies = 0, connections = 0, release, releaseResume;
   const gate = new Promise(resolve => release = resolve);
   const resumeGate = new Promise(resolve => releaseResume = resolve);
@@ -33,7 +33,10 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
         if (webhook) return webhook(req, res, deliveries.at(-1));
         return res.end('{}');
       }
-      if (/^\/v2\/users\/[^/]+\/messages$/.test(req.url)) {
+      if (/^\/v2\/(users|groups)\/[^/]+\/files$/.test(req.url)) {
+        uploads.push(JSON.parse(body)); return res.end('{"file_info":"UPLOADED"}');
+      }
+      if (/^\/v2\/(users|groups)\/[^/]+\/messages$/.test(req.url)) {
         sends.push(JSON.parse(body)); if (holdSend) await gate;
         return res.end('{"id":"SENT"}');
       }
@@ -94,7 +97,7 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
     try { const r = await fetch(child.url + '/health', { signal: AbortSignal.timeout(500) }); return { status: r.status, ...await r.json() }; }
     catch { return {}; }
   }
-  return { root, start, stop, health, resumes, heartbeats, deliveries, sends, release, releaseResume,
+  return { root, start, stop, health, resumes, heartbeats, deliveries, sends, uploads, release, releaseResume,
     dispatch(message) { for (const socket of sockets) if (socket.readyState === 1) socket.send(JSON.stringify(message)); },
     get identifies() { return identifies; }, get connections() { return connections; } };
 }

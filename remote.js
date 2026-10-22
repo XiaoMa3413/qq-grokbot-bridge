@@ -4,6 +4,8 @@ const { digest, targetOf, atomicFile, repliesOf, replyClosed } = require('./jobs
 const { memoryPath, memoryDir } = require('./memory');
 const { REPLY_LIMITS, messageLimit } = require('./policy');
 const { forwardDiagnostic } = require('./forwarding');
+const { OutboundStore } = require('./outbound_store');
+const { MEDIA_LIMITS } = require('./outbound_format');
 const IMAGE_LIMIT = 5 * 1024 * 1024, MEMORY_LIMIT = 64 * 1024;
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function decodeImages(body) {
@@ -27,8 +29,9 @@ function decodeImages(body) {
   }
   return { files };
 }
-function replyFingerprint(body, files) {
-  return digest(JSON.stringify({ content: body.content || '', images: files.map(f => [f.name, digest(f.buf)]) }));
+function replyFingerprint(body, files, media = []) {
+  return digest(JSON.stringify({ content: body.content || '', images: files.map(f => [f.name, digest(f.buf)]),
+    ...(media.length ? { media: media.map(f => [f.kind, f.name, f.sha256]) } : {}) }));
 }
 function readMemory(payload) {
   const file = fs.realpathSync(memoryPath(payload.type, targetOf(payload)));
@@ -41,6 +44,7 @@ function readMemory(payload) {
 class RemoteAccess {
   constructor(store, publicUrl, { mediaRoot = process.env.QQ_MEDIA_DIR || path.join(__dirname, 'data', 'media') } = {}) {
     this.store = store; this.origin = new URL(publicUrl).origin; this.mediaRoot = path.resolve(mediaRoot);
+    this.outbound = new OutboundStore(store);
   }
   assetPath(file) {
     const resolved = fs.realpathSync(file), root = fs.realpathSync(this.mediaRoot);
@@ -75,15 +79,20 @@ class RemoteAccess {
     result.reply_deadline = new Date(job.deadline).toISOString();
     result.reply_policy = { segmented: true, next_reply_seq: repliesOf(job).length + 1,
       message_limit: messageLimit(payload.type, payload.msg_id), progress_max_chars: REPLY_LIMITS.textChars, reserve_final: REPLY_LIMITS.reserveFinal };
+    result.reply_policy.media = { kinds: ['file', 'voice'], voice_formats: ['silk', 'wav', 'mp3', 'flac'],
+      inline_max_bytes: MEDIA_LIMITS.inlineBytes, file_max_bytes: MEDIA_LIMITS.fileBytes, voice_max_bytes: MEDIA_LIMITS.voiceBytes,
+      max_items: MEDIA_LIMITS.count, job_upload_max_bytes: MEDIA_LIMITS.jobBytes,
+      upload_url: `${this.origin}/jobs/${job.id}/uploads` };
     return result;
   }
   handle(req, res, send) {
     if (!req.url.startsWith('/jobs/')) return false;
-    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(memory|media|knowledge)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
+    const match = /^\/jobs\/([a-f0-9]{64})(?:\/(memory|media|knowledge|uploads)(?:\/([a-f0-9]{64}))?)?$/.exec(req.url);
     if (!match) { send(404, { ok: false, error: 'not found' }); return true; }
     const job = this.store.get(match[1]);
     if (!job) { send(404, { ok: false, error: 'unknown job' }); return true; }
     if (this.store.now() >= job.deadline) { send(410, { ok: false, error: 'job expired' }); return true; }
+    if (match[2] === 'uploads' && match[3]) { this.outbound.handle(req, send, job, match[3]); return true; }
     try {
       if (!match[2] && req.method === 'GET') {
         send(200, { ok: true, job_id: job.id, delivery: job.delivery, attempts: job.attempts,

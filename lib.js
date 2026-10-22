@@ -3,6 +3,7 @@ const fs = require('fs'), util = require('util');
 const { Agent, fetch } = require('undici');
 const { parseElements, refMsgIdx, parseRecentContext } = require('./events');
 const { loadConfig, loadReplyToken } = require('./configuration');
+const { uploadMedia } = require('./qq_media');
 const DIR = __dirname;
 // One shared agent for every outbound fetch, so sockets are reused and connect/header/body
 // timeouts are enforced by the agent rather than by the caller.
@@ -58,7 +59,16 @@ class TokenManager {
   }
 }
 class QQApi {
-  constructor(cfg, tm) { this.cfg = cfg; this.tm = tm; this.seq = new Map(); }
+  constructor(cfg, tm, { putMediaPart } = {}) {
+    this.cfg = cfg; this.tm = tm; this.seq = new Map();
+    this.putMediaPart = putMediaPart || (async (url, bytes, timeout) => {
+      // COS gets only its presigned URL and bytes, never QQ or reply credentials.
+      const response = await fetch(url, { method: 'PUT', redirect: 'error', body: bytes,
+        headers: { 'Content-Length': String(bytes.length) }, signal: AbortSignal.timeout(timeout), dispatcher });
+      try { await response.body?.cancel(); } catch { /* Status is already known. */ }
+      if (!response.ok) throw new Error('COS upload failed');
+    });
+  }
   async req(method, p, body) {
     const r = await fetchTimeout(this.cfg.apiBase + p, { method, headers: {
       Authorization: 'QQBot ' + await this.tm.get(), 'Content-Type': 'application/json' },
@@ -82,6 +92,9 @@ class QQApi {
                              : `/v2/groups/${encodeURIComponent(target)}/files`;
     const body = { file_type: 1, file_data: buf.toString('base64'), file_name: fileName, srv_send_msg: false };
     return this.req('POST', p, body);
+  }
+  uploadMedia(type, target, media, options = {}) {
+    return uploadMedia(this, type, target, media, { ...options, put: this.putMediaPart });
   }
   // Send an already-uploaded rich-media image (msg_type 7). fileInfo is the file_info from uploadImage.
   sendMedia(type, target, fileInfo, msgId) {
