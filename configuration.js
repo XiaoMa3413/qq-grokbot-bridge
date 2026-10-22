@@ -1,13 +1,21 @@
 'use strict';
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const { CONTEXT_DEFAULTS } = require('./policy');
 
-function loadConfig({ dir = __dirname, env = process.env } = {}) {
-  const c = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
-  if (c.contextTextMaxChars === undefined) c.contextTextMaxChars = 12000;
+function contextSettings(input = {}) {
+  const c = { ...CONTEXT_DEFAULTS };
+  for (const key of Object.keys(CONTEXT_DEFAULTS)) if (input[key] !== undefined) c[key] = input[key];
   if (!Number.isSafeInteger(c.contextTextMaxChars) || c.contextTextMaxChars < 256 || c.contextTextMaxChars > 65536)
     throw Object.assign(new Error('contextTextMaxChars must be an integer from 256 to 65536'), { code: 'ECONTEXTBUDGET' });
   for (const key of ['historyLimitC2c', 'historyLimitGroup']) if (c[key] !== undefined && (!Number.isSafeInteger(c[key]) || c[key] < 1 || c[key] > 1000))
     throw Object.assign(new Error('history limits must be integers from 1 to 1000'), { code: 'ECONTEXTLIMIT' });
+  return Object.freeze(c);
+}
+function loadConfig({ dir = __dirname, env = process.env } = {}) {
+  const c = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+  if (!c || typeof c !== 'object' || Array.isArray(c))
+    throw Object.assign(new Error('config.json must contain an object'), { code: 'ECONFIG' });
+  Object.assign(c, contextSettings(c));
   c.forwardWebhookUrl = env.QQ_FORWARD_WEBHOOK_URL || c.forwardWebhookUrl;
   if (env.QQ_API_BASE) c.apiBase = env.QQ_API_BASE;
   if (env.QQ_TOKEN_URL) c.tokenUrl = env.QQ_TOKEN_URL;
@@ -19,7 +27,7 @@ function loadConfig({ dir = __dirname, env = process.env } = {}) {
       throw new Error('QQ_REPLY_PUBLIC_URL must be an HTTPS URL ending in /reply without credentials, query or fragment');
     c.replyPublicUrl = u.href;
   }
-  return c;
+  return Object.freeze(c);
 }
 function validateReplyToken(value) {
   if (typeof value !== 'string' || value.trim().length < 32) {
@@ -39,4 +47,4 @@ function loadReplyToken({ dir = __dirname, env = process.env, create = true } = 
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   return validateReplyToken(fs.readFileSync(file, 'utf8'));
 }
-module.exports = { loadConfig, loadReplyToken, validateReplyToken };
+module.exports = { loadConfig, loadReplyToken, validateReplyToken, contextSettings };

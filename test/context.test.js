@@ -2,7 +2,7 @@
 const { test } = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { assembleContext, speakerId } = require('../context');
-const { append, readAll, normalizeEntry } = require('../history');
+const { append, readAll, normalizeEntry, mergeRecent } = require('../history');
 const { loadConfig } = require('../configuration');
 const { parseElements } = require('../events');
 const { fixture, waitFor, event, TOKEN } = require('./helpers/gateway');
@@ -94,6 +94,35 @@ test('history pruning retains questions referenced by kept answers and reports o
   assert.deepEqual(result.history.map(e => e.content), ['question', 'answer']);
   const normalized = normalizeEntry({ role: 'bot', content: 'x'.repeat(2500), reply_to_msg_id: 'Q', reply_to_openid: 'U' });
   assert.equal(normalized.content.length, 2000); assert.equal(normalized.original_content_chars, 2500); assert.equal(normalized.content_truncated, true);
+});
+
+test('recent-context dedup prefers known IDs and only uses text fallback for user records', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-context-')), previous = process.env.QQ_HISTORY_DIR;
+  process.env.QQ_HISTORY_DIR = dir;
+  t.after(() => {
+    previous === undefined ? delete process.env.QQ_HISTORY_DIR : process.env.QQ_HISTORY_DIR = previous;
+    if (path.dirname(dir) !== os.tmpdir() || !path.basename(dir).startsWith('qq-context-')) throw new Error('unexpected test path');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const timestamp = '2026-01-01T12:00:00.000Z';
+  const cases = [
+    { name: 'distinct-ids', stored: { msg_id: 'A' }, incoming: { msg_id: 'B' }, added: 1 },
+    { name: 'same-id', stored: { msg_id: 'A' }, incoming: { msg_id: 'A', author: 'other', content: 'edited', timestamp: '2026-01-02T12:00:00.000Z' }, added: 0 },
+    { name: 'incoming-id-missing', stored: { msg_id: 'A' }, incoming: {}, added: 0 },
+    { name: 'stored-id-missing', stored: {}, incoming: { msg_id: 'B' }, added: 0 },
+    { name: 'nickname-conflict', stored: {}, incoming: { author: 'other' }, added: 1 },
+    { name: 'outside-window', stored: {}, incoming: { timestamp: '2026-01-02T12:00:00.000Z' }, added: 1 },
+    { name: 'bot-is-not-user', stored: { role: 'bot' }, incoming: {}, added: 1 },
+  ];
+  for (const c of cases) {
+    append('group', c.name, { role: 'user', nickname: 'same-name', content: '好', timestamp, ...c.stored });
+    const incoming = { author: 'same-name', content: '好', timestamp, ...c.incoming };
+    assert.equal(mergeRecent('group', c.name, [incoming]), c.added, c.name);
+    const stored = readAll('group', c.name);
+    assert.equal(stored.length, 1 + c.added, c.name);
+    if (c.added) assert.equal(stored[1].msg_id, incoming.msg_id, c.name);
+    assert.equal(mergeRecent('group', c.name, [incoming]), 0, c.name + ' replay');
+  }
 });
 
 test('context budget defaults on older configuration and rejects invalid operator values', t => {

@@ -1,8 +1,7 @@
 'use strict';
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
-const digest = value => crypto.createHash('sha256').update(value).digest('hex');
-const targetOf = p => p.type === 'group' ? p.group_openid : p.openid;
-const idOf = p => digest(JSON.stringify([p.type, targetOf(p), p.msg_id]));
+const { REPLY_LIMITS } = require('./policy');
+const { digest, targetOf, idOf, readJobs } = require('./job_state');
 const repliesOf = job => job.replies || (job.reply ? [job.reply] : []);
 const replyClosed = job => job.reply?.state === 'done' && (job.reply.final !== false || !job.reply.body?.ok);
 function atomicFile(file, contents) {
@@ -28,12 +27,9 @@ class JobStore {
     retentionMs = 7 * 86400000, maxJobs = 10000 } = {}) {
     this.dir = dir; this.now = now; this.retentionMs = retentionMs; this.maxJobs = maxJobs; this.jobs = new Map(); this.order = 0;
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    for (const name of fs.readdirSync(dir).filter(n => /^[a-f0-9]{64}\.json$/.test(n))) {
-      const job = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-      if (job.id + '.json' !== name || idOf(job.payload) !== job.id || job.schema !== 1 || !Number.isSafeInteger(job.order))
-        throw new Error('invalid persisted job: ' + name);
+    const restored = readJobs(dir);
+    for (const job of restored) {
       this.order = Math.max(this.order, job.order);
-      if (job.replies?.length) job.reply = job.replies.at(-1);
       this.jobs.set(job.id, job);
       if (job.delivery === 'dispatching') { job.delivery = 'pending'; job.nextAttemptAt = now(); this.save(job); }
       if (job.reply?.state === 'sending') { job.reply.state = 'uncertain'; this.save(job); }
@@ -56,7 +52,7 @@ class JobStore {
     const now = this.now(), parsed = Date.parse(payload.timestamp);
     const receivedAt = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
     const job = { schema: 1, id, order: ++this.order, payload: structuredClone(payload), createdAt: now,
-      deadline: receivedAt + (payload.type === 'group' ? 5 * 60000 : 60 * 60000),
+      deadline: receivedAt + REPLY_LIMITS.windowMs[payload.type],
       delivery: 'pending', attempts: 0, nextAttemptAt: now, prepared: false, assets: {}, reply: null };
     this.save(job); this.jobs.set(id, job);
     return { job, added: true };
@@ -69,7 +65,7 @@ class JobStore {
   }
   // Persist the intent before any QQ side effect. An interrupted send is never blindly repeated.
   beginReply(job, fingerprint, { seq = 1, final = true } = {}) {
-    if (!Number.isInteger(seq) || seq < 1 || seq > 5 || typeof final !== 'boolean')
+    if (!Number.isInteger(seq) || seq < 1 || seq > REPLY_LIMITS.segments || typeof final !== 'boolean')
       return { status: 400, body: { ok: false, error: 'invalid reply sequence or final flag' } };
     const records = repliesOf(job), existing = records[seq - 1];
     if (existing) {
@@ -132,7 +128,9 @@ class ForwardWorker {
       await Promise.all(eligible.slice(i, i + this.concurrency).map(job => this.dispatch(job)));
   }
   async dispatch(job) {
-    job.delivery = 'dispatching'; job.attempts++; this.store.save(job);
+    // A failed intent write must leave the live job pending for the next worker tick.
+    const next = { ...job, delivery: 'dispatching', attempts: job.attempts + 1 };
+    this.store.save(next); Object.assign(job, next);
     try {
       if (!job.prepared) {
         const prepared = await this.prepare(structuredClone(job.payload), job);

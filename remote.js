@@ -2,6 +2,7 @@
 const fs = require('fs'), path = require('path');
 const { digest, targetOf, atomicFile, repliesOf, replyClosed } = require('./jobs');
 const { memoryPath, memoryDir } = require('./memory');
+const { REPLY_LIMITS, messageLimit } = require('./policy');
 const IMAGE_LIMIT = 5 * 1024 * 1024, MEMORY_LIMIT = 64 * 1024;
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function decodeImages(body) {
@@ -71,7 +72,7 @@ class RemoteAccess {
     result.memory = { content: memory.content, etag: memory.etag };
     result.reply_deadline = new Date(job.deadline).toISOString();
     result.reply_policy = { segmented: true, next_reply_seq: repliesOf(job).length + 1,
-      message_limit: payload.type === 'group' ? 5 : 4, progress_max_chars: 1500, reserve_final: 1 };
+      message_limit: messageLimit(payload.type, payload.msg_id), progress_max_chars: REPLY_LIMITS.textChars, reserve_final: REPLY_LIMITS.reserveFinal };
     return result;
   }
   handle(req, res, send) {
@@ -86,7 +87,7 @@ class RemoteAccess {
         send(200, { ok: true, job_id: job.id, delivery: job.delivery, attempts: job.attempts,
           reply: job.reply?.state === 'done' && !replyClosed(job) ? 'awaiting_final' : job.reply?.state || 'pending', reply_http_status: job.reply?.httpStatus || null,
           reply_final: !!job.reply && job.reply.final !== false, reply_closed: replyClosed(job), next_reply_seq: repliesOf(job).length + 1,
-          messages_used: job.sentCount || 0, messages_remaining: Math.max(0, (job.payload.type === 'group' ? 5 : 4) - (job.sentCount || 0)),
+          messages_used: job.sentCount || 0, messages_remaining: Math.max(0, messageLimit(job.payload.type, job.payload.msg_id) - (job.sentCount || 0)),
           replies: repliesOf(job).map(r => ({ reply_seq: r.seq || 1, final: r.final !== false, state: r.state, http_status: r.httpStatus || null })),
           last_error: job.lastError || null, deadline: new Date(job.deadline).toISOString() });
       } else if (match[2] === 'media' && match[3] && req.method === 'GET') {

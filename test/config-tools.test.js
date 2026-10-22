@@ -8,7 +8,7 @@ const { diagnose } = require('../scripts/doctor');
 const TOKEN = 'setup-test-token-0123456789abcdef0123456789';
 function fixture(t, { dependencies = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-config-test-'));
-  for (const file of ['.env.example', 'config.json', 'configuration.js', 'scripts/setup.js', 'scripts/doctor.js', 'scripts/config-tools.js']) {
+  for (const file of ['.env.example', 'config.json', 'configuration.js', 'policy.js', 'job_state.js', 'scripts/setup.js', 'scripts/doctor.js', 'scripts/config-tools.js']) {
     const target = path.join(dir, file); fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(__dirname, '..', file), target);
   }

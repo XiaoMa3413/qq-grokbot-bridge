@@ -1,13 +1,12 @@
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path');
 const { log } = require('./lib');
-const { append, readAll } = require('./history');
+const defaultHistory = require('./history');
 const { decodeImages, replyFingerprint } = require('./remote');
 const { repliesOf } = require('./jobs');
-const MAX_LEN = 1500;                        // QQ message content limit we split at
+const { REPLY_LIMITS, messageLimit } = require('./policy');
+const MAX_LEN = REPLY_LIMITS.textChars;
 const TRUNC_NOTE = '\n…（内容过长，已截断）';
-const ACTIVE_MAX = 5;                        // active (no msg_id): at most 5 messages
-const PASSIVE_CAP = { c2c: 4, group: 5 };    // passive replies per msg_id (QQ limits)
 // Split text into parts of at most `max` chars, preferring paragraph (\n\n), then line (\n) boundaries, then a hard cut. Each part keeps its trailing separator, so parts.join('') restores the original.
 function splitContent(text, max) {
   const out = []; let rest = String(text);
@@ -28,7 +27,7 @@ function splitContent(text, max) {
 }
 // parts = the messages to send now; total = parts the full content would need; truncated = the last part was cut short.
 function planParts(content, type, msgId, sentCount) {
-  const cap = msgId ? (PASSIVE_CAP[type] || ACTIVE_MAX) : ACTIVE_MAX;
+  const cap = messageLimit(type, msgId);
   const allowed = Math.max(0, cap - sentCount);
   const all = splitContent(content, MAX_LEN), total = all.length;
   let parts = all, truncated = false;
@@ -60,7 +59,8 @@ function loadImages(j) {
   }
   return { files };
 }
-function createReplyServer(api, token, getHealth, { remote = false, store = null, access = null } = {}) {
+function createReplyServer(api, token, getHealth, { remote = false, store = null, access = null, history = defaultHistory } = {}) {
+  const { append, readAll } = history;
   return http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     const send = (c, o) => {
       if (res.destroyed || res.writableEnded) return;
@@ -103,13 +103,13 @@ function createReplyServer(api, token, getHealth, { remote = false, store = null
       const seq = j.reply_seq === undefined ? 1 : j.reply_seq, final = j.final === undefined ? true : j.final;
       if ((j.reply_seq !== undefined || j.final !== undefined) && !store)
         return send(400, { ok: false, error: 'segmented replies require durable remote mode' });
-      if (!Number.isInteger(seq) || seq < 1 || seq > 5 || typeof final !== 'boolean' || (!final && j.reply_seq === undefined))
-        return send(400, { ok: false, error: 'reply_seq must be an integer from 1 to 5; final must be boolean; progress requires reply_seq' });
+      if (!Number.isInteger(seq) || seq < 1 || seq > REPLY_LIMITS.segments || typeof final !== 'boolean' || (!final && j.reply_seq === undefined))
+        return send(400, { ok: false, error: `reply_seq must be an integer from 1 to ${REPLY_LIMITS.segments}; final must be boolean; progress requires reply_seq` });
       if (!final && (!hasText || j.content.length > MAX_LEN || hasImg))
-        return send(400, { ok: false, error: 'progress must be a single text message of at most 1500 characters, without images' });
-      const cap = j.msg_id ? (PASSIVE_CAP[j.type] || ACTIVE_MAX) : ACTIVE_MAX;
+        return send(400, { ok: false, error: `progress must be a single text message of at most ${MAX_LEN} characters, without images` });
+      const cap = messageLimit(j.type, j.msg_id);
       const used = Math.max(j.msg_id ? (api.seq.get(j.msg_id) || 0) : 0, job?.sentCount || 0);
-      if (job && !repliesOf(job)[seq - 1] && used >= cap - (final ? 0 : 1))
+      if (job && !repliesOf(job)[seq - 1] && used >= cap - (final ? 0 : REPLY_LIMITS.reserveFinal))
         return send(409, { ok: false, error: final ? 'QQ reply quota exhausted' : 'reserve at least one QQ message for the final reply', messages_remaining: Math.max(0, cap - used) });
       if (job) {
         try {

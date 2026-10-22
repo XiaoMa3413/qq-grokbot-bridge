@@ -59,6 +59,45 @@ test('durable queue restores retries, honors Retry-After and never replays an ac
   assert.equal(restored.get(second.job.id).delivery, 'accepted');
 });
 
+test('a failed dispatch intent recovers without restart and preserves conversation order', async t => {
+  const f = setup(t), first = f.store.enqueue(payload()).job;
+  const second = f.store.enqueue(payload('m2')).job;
+  const save = f.store.save.bind(f.store), calls = [];
+  let failNextSave = true, preparations = 0;
+  f.store.save = job => {
+    if (failNextSave) {
+      failNextSave = false;
+      throw Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
+    }
+    save(job);
+  };
+  const worker = new ForwardWorker(f.store, {
+    prepare: async p => { preparations++; return p; },
+    send: async (p, job) => {
+      const persisted = JSON.parse(fs.readFileSync(path.join(f.store.dir, job.id + '.json'), 'utf8'));
+      assert.equal(persisted.delivery, 'dispatching');
+      assert.equal(persisted.attempts, 1);
+      calls.push(p.msg_id);
+      return { ok: true, status: 200 };
+    },
+  });
+  await assert.rejects(worker.runOnce(), { code: 'ENOSPC' });
+  const persisted = JSON.parse(fs.readFileSync(path.join(f.store.dir, first.id + '.json'), 'utf8'));
+  assert.equal(first.delivery, 'pending'); assert.equal(first.attempts, 0);
+  assert.equal(persisted.delivery, 'pending'); assert.equal(persisted.attempts, 0);
+  assert.equal(preparations, 0); assert.deepEqual(calls, []);
+
+  // The same worker/store must recover; restarting would hide the original bug.
+  await worker.runOnce();
+  assert.deepEqual(calls, ['m1']); assert.equal(first.attempts, 1);
+  assert.equal(second.delivery, 'pending'); assert.equal(second.attempts, 0);
+  await worker.runOnce(); assert.deepEqual(calls, ['m1']);
+  f.store.beginReply(first, 'final'); f.store.finishReply(first, 200, { ok: true });
+  await worker.runOnce();
+  assert.deepEqual(calls, ['m1', 'm2']); assert.equal(preparations, 2);
+  assert.equal(second.delivery, 'accepted');
+});
+
 test('pending jobs expire at QQ deadlines and a permanent webhook error is not retried', async t => {
   const f = setup(t);
   const group = f.store.enqueue({ type: 'group', group_openid: 'G', msg_id: 'g1', timestamp: new Date().toISOString() }).job;
@@ -191,6 +230,27 @@ test('full size images are bounded without regex recursion or permissive base64 
   assert.ok(decodeImages({ images_base64: [{ data: 'AB==' }] }).error);
   const threeMiB = image.subarray(0, 3 * 1024 * 1024).toString('base64');
   assert.ok(decodeImages({ images_base64: [{ data: threeMiB }, { data: threeMiB }] }).error);
+});
+
+for (const [type, cap] of [['c2c', 4], ['group', 5]]) test(`${type} advertised reply policy matches enforced limits and remaining quota`, async t => {
+  const f = setup(t), p = type === 'c2c' ? payload() : { ...payload(), type, group_openid: 'G' };
+  const job = f.store.enqueue(p).job, access = new RemoteAccess(f.store, 'https://bridge.example/reply');
+  const policy = access.payload(p, job).reply_policy;
+  assert.equal(policy.message_limit, cap);
+  let sends = 0;
+  const base = await server(t, f.store, access, { seq: new Map(), send: async () => { sends++; return { id: 'SENT' }; } });
+  const reply = (seq, final, content = 'working') => request(base, '/reply', { ...p, reply_seq: seq, final, content });
+  assert.equal((await reply(1, false, 'x'.repeat(policy.progress_max_chars + 1))).status, 400);
+  for (let seq = 1; seq <= cap - policy.reserve_final; seq++) {
+    const r = await reply(seq, false, 'x'.repeat(policy.progress_max_chars));
+    assert.equal(r.status, 200); assert.equal((await r.json()).messages_remaining, cap - seq);
+  }
+  assert.equal((await reply(cap, false)).status, 409);
+  const final = await reply(cap, true, 'done');
+  assert.equal(final.status, 200); assert.equal((await final.json()).messages_remaining, 0);
+  assert.equal(sends, cap);
+  const status = await (await request(base, `/jobs/${job.id}`, undefined, { method: 'GET' })).json();
+  assert.equal(status.messages_remaining, 0); assert.equal(status.reply_closed, true);
 });
 
 test('queue capacity, retention and corrupt-state handling are explicit', t => {

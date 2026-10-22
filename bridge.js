@@ -5,7 +5,7 @@ const { loadConfig, log, toPayload, loadReplyToken, TokenManager, QQApi, HTTP_TI
 const { createReplyServer } = require('./reply_server');
 const { downloadImages } = require('./media');
 const { SeenIds, RecentImages, redact } = require('./events');
-const { readAll, historyLimit, append, mergeRecent } = require('./history');
+const { createHistory } = require('./history');
 const { assembleContext, speakerId } = require('./context');
 const { memoryPath } = require('./memory');
 const { Watchdog } = require('./watchdog');
@@ -19,6 +19,8 @@ const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
 async function start() {
 const cfg = loadConfig();
+const history = createHistory({ dir: process.env.QQ_HISTORY_DIR || path.join(__dirname, 'data', 'history'), config: cfg });
+const { readAll, historyLimit, append, mergeRecent } = history;
 const queueDir = path.resolve(process.env.QQ_JOBS_DIR || path.join(__dirname, 'data', 'jobs'));
 await acquireInstanceLock(queueDir);
 const checkpoint = cfg.replyPublicUrl ? new GatewaySession(queueDir, APP_ID) : null;
@@ -62,7 +64,7 @@ if (cfg.replyPublicUrl) jobs = new JobStore({ dir: queueDir });
 const remoteAccess = jobs ? new RemoteAccess(jobs, cfg.replyPublicUrl) : null;
 if (!cfg.forwardWebhookUrl) log('WARN: no forward webhook URL (QQ_FORWARD_WEBHOOK_URL / config.json); messages will only be logged');
 const tm = new TokenManager(cfg, APP_ID, SECRET), api = new QQApi(cfg, tm);
-const srv = createReplyServer(api, loadReplyToken(), livenessHealth, { remote: !!cfg.replyPublicUrl, store: jobs, access: remoteAccess });
+const srv = createReplyServer(api, loadReplyToken(), livenessHealth, { remote: !!cfg.replyPublicUrl, store: jobs, access: remoteAccess, history });
 srv.listen(cfg.replyPort, cfg.replyHost, () => log(`reply server on http://${cfg.replyHost}:${cfg.replyPort}`));
 setInterval(() => tm.get().catch(e => log('token refresh error', e.message)), 30000);
 
@@ -259,4 +261,4 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   srv.close(async () => { await worker?.running; process.exit(0); });
 });
 }
-start().catch(e => { console.error('FATAL:', e.message); process.exit(e.code === 'EINSTANCELOCKED' ? 78 : 1); });
+start().catch(e => { console.error('FATAL:', e.message); process.exit(['EINSTANCELOCKED', 'EJOBSTATE'].includes(e.code) ? 78 : 1); });
