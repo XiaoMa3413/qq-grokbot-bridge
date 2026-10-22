@@ -45,10 +45,14 @@ function post(base, body, token = TOKEN) {
   return fetch(base + '/reply', { method: 'POST', headers: { 'X-Reply-Token': token, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 }
 function metadata(kind = 'file', name = '报告.txt', data = Buffer.from('report')) { return { kind, name, bytes: data.length, sha256: sha256(data) }; }
-function headers(item) { return { 'X-Reply-Token': TOKEN, 'Content-Type': 'application/octet-stream', 'Content-Length': String(item.bytes),
+function headers(item) { return { 'X-Reply-Token': TOKEN, 'Content-Type': 'application/octet-stream', 'content-length': String(item.bytes),
   'X-Media-Kind': item.kind, 'X-Media-Name': encodeURIComponent(item.name), 'X-Content-SHA256': item.sha256 }; }
 function put(base, job, item, data, changes = {}) {
-  return fetch(base + `/jobs/${job.id}/uploads/${uploadId(item)}`, { method: 'PUT', headers: { ...headers(item), ...changes }, body: data });
+  const requestHeaders = { ...headers(item), ...changes };
+  // fetch computes Buffer length. Node 22 can append a second length when
+  // given both a known-length body and an explicit Content-Length header.
+  delete requestHeaders['content-length'];
+  return fetch(base + `/jobs/${job.id}/uploads/${uploadId(item)}`, { method: 'PUT', headers: requestHeaders, body: data });
 }
 function inline(kind, name, data) { return { kind, name, data: data.toString('base64') }; }
 

@@ -64,7 +64,8 @@ class QQApi {
     this.putMediaPart = putMediaPart || (async (url, bytes, timeout) => {
       // COS gets only its presigned URL and bytes, never QQ or reply credentials.
       const response = await fetch(url, { method: 'PUT', redirect: 'error', body: bytes,
-        headers: { 'Content-Length': String(bytes.length) }, signal: AbortSignal.timeout(timeout), dispatcher });
+        // Buffer bodies get Content-Length from fetch; do not append it twice.
+        signal: AbortSignal.timeout(timeout), dispatcher });
       try { await response.body?.cancel(); } catch { /* Status is already known. */ }
       if (!response.ok) throw new Error('COS upload failed');
     });

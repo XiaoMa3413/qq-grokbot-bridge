@@ -24,7 +24,7 @@ async function main() {
   try {
     const response = await fetch(new URL(`/jobs/${options.job}/uploads/${id}`, url), { method: 'PUT', redirect: 'error', duplex: 'half',
       body: stream, signal: AbortSignal.timeout(MEDIA_LIMITS.uploadTimeoutMs), headers: { 'X-Reply-Token': token,
-        'Content-Type': 'application/octet-stream', 'Content-Length': String(media.bytes), 'X-Media-Kind': media.kind,
+        'Content-Type': 'application/octet-stream', 'content-length': String(media.bytes), 'X-Media-Kind': media.kind,
         'X-Media-Name': encodeURIComponent(media.name), 'X-Content-SHA256': media.sha256 } });
     let text = '';
     for await (const chunk of response.body) { text += Buffer.from(chunk).toString('utf8'); if (text.length > 8192) throw new Error('response too large'); }
