@@ -15,7 +15,7 @@ async function freePort() {
   const app = http.createServer(); await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
   const port = app.address().port; await new Promise(resolve => app.close(resolve)); return port;
 }
-async function fixture(t, { events = [], holdSend = false, holdResume = false, rejectResume = false } = {}) {
+async function fixture(t, { events = [], holdSend = false, holdResume = false, rejectResume = false, webhook } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-ingress-test-'));
   const children = [], sockets = new Set(), resumes = [], heartbeats = [], deliveries = [], sends = [];
   let identifies = 0, connections = 0, release, releaseResume;
@@ -28,7 +28,11 @@ async function fixture(t, { events = [], holdSend = false, holdResume = false, r
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
-      if (req.url === '/webhook') { deliveries.push(JSON.parse(body)); return res.end('{}'); }
+      if (req.url === '/webhook') {
+        deliveries.push(JSON.parse(body));
+        if (webhook) return webhook(req, res, deliveries.at(-1));
+        return res.end('{}');
+      }
       if (/^\/v2\/users\/[^/]+\/messages$/.test(req.url)) {
         sends.push(JSON.parse(body)); if (holdSend) await gate;
         return res.end('{"id":"SENT"}');

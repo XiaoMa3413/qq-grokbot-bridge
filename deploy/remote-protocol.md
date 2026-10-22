@@ -14,7 +14,7 @@ Windows/Linux 桥接启动时，先对规范化后的队列目录获取本机进
 
 设置 `QQ_REPLY_PUBLIC_URL` 后启用持久化任务。QQ 消息先写入 `data/jobs/<job_id>.json`，再下载附件、附加历史和记忆并转发。重复网关事件使用同一任务；同会话按接收顺序等待上一任务完成，不同会话最多同时转发 4 个任务。
 
-HTTP 408、429、5xx 或网络失败会指数退避重试，最多间隔 60 秒，并遵守 `Retry-After`；其他 HTTP 错误终止该任务。webhook 返回 2xx 后，只等待回传，不因回复慢而重新触发 Grok。若平台已接收请求但网络响应丢失，仍可能重复触发 Grok，不能保证平台只执行一次；回传防重用于避免同一任务重复发 QQ。
+v1.7 起，准备失败、明确的连接前失败和 HTTP 429 会指数退避重试，退避基准最多 60 秒，429 遵守 `Retry-After` 且不超过任务截止时间。HTTP 408/5xx、普通超时、连接重置和未知传输错误标记投递 `uncertain`，停止自动重投；其他 HTTP 错误终止该任务。webhook 返回 2xx 后，只等待回传，不因回复慢而重新触发 Grok。结果不明继续占住同会话队列，但原期限内仍接受正常回传。人工重投可能重复执行远端任务，不能保证平台只执行一次；流程见[投递诊断与人工重投](forward-recovery.md)。回传防重仍用于避免同一任务重复发 QQ。
 
 转发和回复受 QQ 消息原始时间限制：群聊 5 分钟、单聊 60 分钟。排队不会延长时限；到期返回 410，不改成主动推送。规则依据：[腾讯消息接口](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md)。
 
@@ -117,9 +117,13 @@ v1.6 另提供只读 `knowledge` 和 `knowledge_url`：角色与选定事实按�
 
 `npm run status` 在桥接主机查看健康及队列计数；`journalctl --user -u qq-grokbot-bridge -f` 查看日志。`reply HTTP 401/400/409/...` 可区分鉴权、协议和防重问题；日志不打印回复密钥或正文。
 
+v1.7 状态增加 `forward`，提供最后一次投递的 `phase`、`outcome`、安全分类 `code`、时间及可用的 HTTP 状态；不返回原始网络错误。投递 `uncertain` 与回复 `reply:uncertain` 是两个阶段；Grok 不应自行重投 webhook。`jobs.forward_uncertain` 单独统计有效期内的投递不明，`jobs.uncertain` 同时包含原有 QQ 发送不明。
+
 程序收到 SIGTERM/SIGINT 后停止接收新请求及重连，等待正在执行的回调/转发完成，最多 30 秒。超时退出后的发送状态按上述 `uncertain` 规则处理。
 
 ## 升级与回退
+
+v1.7 增加投递 `uncertain` 及可选的 `forward` / `redrives` 元数据，旧 `dispatching` 恢复时保守地暂停重投。低于 v1.7 的校验器可能拒绝新状态或采用旧自动重试行为，回退前需按[投递恢复说明](forward-recovery.md#升级与回退)处理在途状态；不能直接恢复旧队列来强制重发。
 
 v1.5.1 在恢复任务和执行保留期清理前，先只读校验整个队列：路由与文件 ID、状态、有效时间、计数、媒体映射及回复序列必须有效，重复顺序号和未知 schema 也会报错。损坏记录不会被跳过或自动删除；启动报告文件名和字段并以退出码 78 停止。`npm run doctor -- --remote` 的 `job_state` 使用相同校验器，不修改任务；修复后重新启动服务。
 
