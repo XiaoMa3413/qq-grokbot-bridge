@@ -116,6 +116,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Client:
     def __init__(self, args):
         self.args, self.timings = args, []
+        self.protected_paths = {Path(args.config).resolve()} if args.config else set()
         config = read_json(args.config, 16384) if args.config else {}
         require(set(config) <= {"reply_url", "reply_token_file"}, "unknown_config_field")
         url = os.environ.get("QQ_REPLY_URL") or config.get("reply_url")
@@ -129,13 +130,15 @@ class Client:
         require(not any(ord(c) < 33 for c in url), "invalid_reply_url")
         self.url, self.origin = url, urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
         token = os.environ.get("QQ_REPLY_TOKEN")
-        if token is None and config.get("reply_token_file"):
+        if config.get("reply_token_file"):
             require(isinstance(config["reply_token_file"], str) and bool(config["reply_token_file"]), "invalid_token_file")
             token_path = Path(config["reply_token_file"])
             if not token_path.is_absolute():
                 token_path = Path(args.config).absolute().parent / token_path
-            with open(token_path, encoding="utf-8-sig") as source:
-                token = source.read(4097).strip()
+            self.protected_paths.add(token_path.resolve())
+            if token is None:
+                with open(token_path, encoding="utf-8-sig") as source:
+                    token = source.read(4097).strip()
         self.token = token
         self.token_available = (isinstance(token, str) and 32 <= len(token) <= 4096 and token.isascii()
                                 and all(ord(char) >= 32 and ord(char) != 127 for char in token))
@@ -172,6 +175,7 @@ class Client:
 
     def load_task(self):
         require(bool(self.args.task), "task_file_required")
+        self.protected_paths.add(Path(self.args.task).resolve())
         task = read_json(self.args.task)
         require(isinstance(task.get("job_id"), str) and bool(HEX.fullmatch(task["job_id"])), "invalid_job_id")
         require(task.get("type") in ("c2c", "group"), "invalid_task_route")
@@ -216,6 +220,9 @@ class Client:
         for kind, files in (("image", self.args.image), ("file", self.args.file), ("voice", self.args.voice)):
             for file in files:
                 path = Path(file)
+                resolved = path.resolve()
+                require(resolved not in self.protected_paths and not resolved.is_relative_to(self.state_root),
+                        "private_artifact_rejected")
                 name, size = path.name, path.stat().st_size
                 require(path.is_file() and 0 < size <= (100 * MIB if kind == "file" else
                         20 * MIB if kind == "voice" else 5 * MIB), "invalid_artifact_size")
@@ -301,6 +308,7 @@ class Client:
         require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.args.operation)), "invalid_operation")
         state_root = Path(self.args.state_dir) if self.args.state_dir else Path(__file__).absolute().parent / ".state"
         private_dir(state_root)
+        self.state_root = state_root.resolve()
         directory = state_root / self.task["job_id"]
         with job_lock(directory):
             journal = directory / (self.args.operation + ".json")

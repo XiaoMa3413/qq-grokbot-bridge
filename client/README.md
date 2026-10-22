@@ -49,7 +49,7 @@ python qq_bridge.py --config private/client.json --task private/task.json final 
 python qq_bridge.py --config private/client.json --task private/task.json final --image artifacts/result.png
 ```
 
-每种附件选项可重复。图片只支持 PNG/JPEG；语音检查 SILK/WAV/MP3/FLAC 扩展名及文件头，不进行完整解码或转码。普通文件名可使用中文。图片与媒体合计最多 5 个，进度、拆分正文及每个附件共享 QQ 剩余配额。
+每种附件选项可重复，只传已授权的本地结果文件。已配置的密钥文件、配置 JSON、原任务文件及客户端状态目录内的文件禁止作为附件（包含通过符号链接访问同一目标的情况）；工具不是通用文件权限沙箱，不自动收集目录。图片只支持 PNG/JPEG；语音检查 SILK/WAV/MP3/FLAC 扩展名及文件头，不进行完整解码或转码。普通文件名可使用中文。图片与媒体合计最多 5 个，进度、拆分正文及每个附件共享 QQ 剩余配额。
 
 工具先计算正文拆分和配额，超额时在上传/发送前拒绝，避免服务端裁掉结果。内联合计不超过 5 MiB 时自动编码；否则文件/语音通过二进制上传后引用，图片仍内联。文件最多 100 MiB、语音 20 MiB，具体以本次能力声明为准。既有上传条目仍占任务存储配额，服务端有最终裁决权。
 

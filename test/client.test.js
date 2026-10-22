@@ -153,6 +153,15 @@ test('client checks quota and voice format before any upload or QQ send', async 
   assert.equal(fs.existsSync(path.join(f.state, f.job.id, 'final.json')), false);
 });
 
+test('known credential, configuration and original task files cannot be attached as artifacts', async t => {
+  const f = await fixture(t);
+  for (const file of [path.join(f.root, 'token'), f.config, f.task]) {
+    const result = await f.cli(['final', '--file', file]);
+    assert.equal(result.value.error, 'private_artifact_rejected'); assert.ok(!result.stdout.includes(TOKEN));
+  }
+  assert.equal(f.requests.length, 0); assert.equal(f.calls.length, 0);
+});
+
 test('a lost POST response leaves an immutable outbox; explicit resume replays the exact segment without another QQ send', async t => {
   const f = await fixture(t); f.controls.dropReply = true;
   const result = await f.cli(['final', '--text', 'answer']);
