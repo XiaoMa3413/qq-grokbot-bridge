@@ -37,8 +37,12 @@ function toPayload(t, d) {
     message_type: d.message_type ?? null, ref_msg_idx: refMsgIdx(d), quoted: parseElements(d).quoted,
     recent_context: (t === 'GROUP_AT_MESSAGE_CREATE' || t === 'GROUP_MESSAGE_CREATE') ? parseRecentContext(d) : [] };
   if (t === 'C2C_MESSAGE_CREATE') return { type: 'c2c', openid: d.author && d.author.user_openid, ...base };
-  if (t === 'GROUP_AT_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: true, ...base };
-  if (t === 'GROUP_MESSAGE_CREATE') return { type: 'group', group_openid: d.group_openid, at: false, ...base };
+  if (t === 'GROUP_AT_MESSAGE_CREATE' || t === 'GROUP_MESSAGE_CREATE') {
+    const mentions = (Array.isArray(d.mentions) ? d.mentions : []).filter(u => u && typeof u === 'object').slice(0, 100)
+      .map(u => Object.fromEntries(['id', 'member_openid', 'username', 'bot'].filter(key =>
+        key === 'bot' ? typeof u[key] === 'boolean' : typeof u[key] === 'string').map(key => [key, u[key]])));
+    return { type: 'group', group_openid: d.group_openid, at: t === 'GROUP_AT_MESSAGE_CREATE', ...base, mentions };
+  }
   return null;
 }
 class TokenManager {
