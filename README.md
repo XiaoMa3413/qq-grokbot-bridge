@@ -29,7 +29,7 @@ Grok 云电脑可能在无活动时暂停，后台脚本也会一起停止，仅
 flowchart LR
     Q[QQ 用户 / 群] -->|QQ 网关事件| B[常驻主机上的桥接]
     B -->|官方 webhook| G[Grok Bot 例行任务]
-    G -->|HTTPS 回传 / 图片 / 记忆| T[隧道或反向代理]
+    G -->|HTTPS 回传 / 附件 / 记忆| T[隧道或反向代理]
     T -->|本机 HTTP| B
     B -->|QQ OpenAPI| Q
 ```
@@ -44,6 +44,7 @@ flowchart LR
 | 群内非 @ 消息 | 收到事件时只记录历史、缓存最近图片，不触发回复；是否收到取决于 QQ 权限与群设置 |
 | 对话历史与记忆 | 私聊最多 20 条、群聊最多 10 条历史，关联完整问答并按身份/引用选择；每会话独立 Markdown 记忆，远程写入有并发校验 |
 | 图片 | 入站图片提供鉴权下载；远程回图使用 `images_base64`，支持 PNG/JPEG |
+| 文件与语音 | 最终回复支持普通文件、已生成的音频；大文件先流式上传再引用，实际 QQ 权限与播放需验收 |
 | 持久化队列 | 远程模式先落盘再转发；同会话顺序处理，不同会话最多并行 4 个任务 |
 | 重试与回调防重 | 明确连接前失败及 429 按时限重试；投递结果不明暂停重投；相同最终回调返回已保存结果 |
 | 分段回复 | Grok 可先回“正在处理”，再发最终结果；每段有序号并独立防重，共享原消息配额和截止时间 |
@@ -106,7 +107,7 @@ npm run doctor -- --remote
 
 默认密钥已由 `setup` 保存到项目根目录 `reply_token`；如果 `.env` 已设置 `QQ_REPLY_TOKEN`，使用该固定值。通过安全凭据配置将同一个值提供给 Grok 执行环境，并设置 `QQ_REPLY_URL` 等于桥接的 `QQ_REPLY_PUBLIC_URL`。
 
-将 [Grok 任务规则](DEPLOY_AGENT.md#可复制到-grok-例行任务的规则) 复制到 webhook 例行任务。任务使用固定地址和密钥回传最终回复，支持图文及会话记忆。
+将 [Grok 任务规则](DEPLOY_AGENT.md#可复制到-grok-例行任务的规则) 复制到 webhook 例行任务。任务使用固定地址和密钥回传回复，支持图文、文件/语音及会话记忆。语音生成与发送分开，桥接不内置 TTS；文件权限及音频格式需按当前机器人验收。
 
 ### 4. 启动与验证
 
@@ -171,6 +172,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | 查看服务日志 | `journalctl --user -u qq-grokbot-bridge -f` |
 | 启动 Linux 服务 | `systemctl --user start qq-grokbot-bridge`，停止或重启使用 `stop` / `restart` |
 | 远程回传 | 使用 HTTP 工具，或配置 `QQ_REPLY_URL` / `QQ_REPLY_TOKEN` 后运行 `npm run reply`，JSON 从 stdin 输入 |
+| 上传回复附件 | Grok 执行环境运行 `npm run upload-media -- --job <job_id> --kind file --file ./report.pdf`；返回引用供最终回复使用，详见[文件与语音](deploy/file-voice.md) |
 
 `doctor` 默认只读本地文件，不生成密钥、不连接 QQ 或 Grok。`--live` 额外查询本机健康接口；`--remote` 要求启用远程模式。存在 `FAIL` 时退出码为 1，只有 `PASS` / `WARN` 时为 0。检查通过代表本地配置满足条件，实际凭据有效性和公网连通性仍需通过收发测试验证。初始化和诊断命令适用于当前源码，使用旧标签时按该标签自带的说明部署。
 
@@ -190,7 +192,9 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 
 ## 数据、测试与版本
 
-运行数据位于 `data/history/`、`data/media/`、`data/jobs/`、`data/knowledge/`、`memory/` 和 `logs/`；systemd 的标准输出由 journal 保存。`.env`、`reply_token` 及运行数据已被 Git 忽略，仍应限制访问并单独备份。任务默认保留至截止时间后 7 天、最多 10,000 项；媒体目前不自动清理。
+运行数据位于 `data/history/`、`data/media/`、`data/jobs/`、`data/knowledge/`、`memory/` 和 `logs/`；systemd 的标准输出由 journal 保存。`.env`、`reply_token` 及运行数据已被 Git 忽略，仍应限制访问并单独备份。任务默认保留至截止时间后 7 天、最多 10,000 项；入站媒体缓存目前不自动清理。
+
+文件/语音的出站上传保存在 `<QQ_JOBS_DIR>/outbound/`，随任务保留期清理，备份时包含整个队列目录。该清理不涵盖旧的入站 `data/media/` 缓存。单文件桥接上限 100 MiB、语音 20 MiB；公网入口需允许 100 MiB 二进制请求。小文件可用 `media_base64`，与图片共用 5 MiB 内联限制。具体协议、权限和配额见[文件与语音](deploy/file-voice.md)。
 
 `npm test` 覆盖事件解析、历史、鉴权、图片、记忆并发、任务恢复、防重及模拟服务集成。首次部署还需通过 QQ 发送实际消息，确认 Grok 任务执行并成功回传；完整验收步骤见 [部署指南](DEPLOY_AGENT.md#7-按阶段验收)。
 
@@ -202,6 +206,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 | [Grok 任务配置](deploy/grok-routine.md) | 凭据迁移及可复制的例行任务规则 |
 | [远程协议](deploy/remote-protocol.md) | 任务、图片、记忆、错误码及恢复语义 |
 | [投递诊断与人工重投](deploy/forward-recovery.md) | 结果不明分类、只读诊断、版本检查与主机重投流程 |
+| [文件发送与语音回复](deploy/file-voice.md) | 内联/流式回传、分片上传、TTS 边界、权限与真实验收 |
 | [角色与选定事实导入](deploy/knowledge-import.md) | 按会话预览/提交、来源版本、删除与任务只读快照 |
 | [Sakura FRP 部署示例](deploy/sakura-frp.md) | 通用隧道设置与连通性验证 |
 | [版本与回退](deploy/releases.md) | 发布、升级、备份和回退 |

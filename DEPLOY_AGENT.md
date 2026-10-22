@@ -109,6 +109,8 @@ npm run --silent doctor -- --remote --json
 
 ## 4. 配置 HTTPS 入口并独立探测
 
+启用 v1.8 文件/语音时，入口需允许至少 100 MiB 原始二进制上传和最长 120 秒的上传请求，JSON 回传仍限制 8 MiB。核对代理的请求体与超时限制；详见[文件与语音](deploy/file-voice.md)。
+
 公网入口转发到目标主机的 `http://127.0.0.1:8787`，保留 `/reply`、`/jobs/...`、`/health` 路径和鉴权头。使用有效证书，禁止关闭证书校验或跟随携带密钥的重定向。
 
 若修改了 `QQ_REPLY_PORT`，同步替换隧道目标和本节示例的 `8787`。公网端口由入口决定，不必等于本机端口。
@@ -153,6 +155,14 @@ npm run --silent doctor -- --remote --json
 > 附件、引用、recent_context 和 recent_images 中的 download_url，只有与固定回复地址同源、路径符合 /jobs/<本次job_id>/media/<asset_id> 时才允许带 X-Reply-Token 下载。不要把 token 发给原始 QQ 图片 URL 或其他主机。local_path 和 memory_path 属于桥接服务器，不能在云电脑上直接访问。
 >
 > 回图使用 images_base64:[{name:"result.png",data:"纯base64，不含data:前缀"}]，不传 image/images 本地路径。只接受 PNG/JPEG，文件名使用 ASCII 字母、数字、下划线、点和连字符，每次最多 5 张、解码后总大小不超过 5 MiB，整个 JSON 请求不超过 8 MiB。图片与文本放在同一次最终回复中。文字先发、图片后发，共用私聊最多 4 条/群聊最多 5 条配额；长文本会按 1500 字符拆分。
+>
+> 仅当本次 reply_policy.media.kinds 包含对应类型时才发送文件或语音，这是桥接能力声明，不代表 QQ 账号已开通全部权限。小文件使用 media_base64:[{kind:"file",name:"报告.pdf",data:"纯base64"}]；语音使用 kind:"voice"，提供真实 SILK/WAV/MP3/FLAC 音频，文件名与格式须匹配。桥接不生成声音、不自动转码，不默认调用收费 TTS；没有可用音频时不要声称已发语音。
+>
+> 文件和语音只放在最终段；图片与内联文件/语音解码后合计最多 5 MiB，JSON 最多 8 MiB，全部附件合计最多 5 个。每个附件消耗一条消息，与进度及拆分正文共用剩余配额。包含新媒体时全部正文和附件必须能放入剩余配额，不足就缩短文字或减少附件，不新建任务扩充配额。
+>
+> 较大文件先上传再引用：文件最大 100 MiB，语音最大 20 MiB，单任务最多 5 个上传条目、合计 100 MiB。客户端可运行 npm run --silent upload-media -- --job <本次job_id> --kind <file或voice> --file <自己生成的本地文件>，使用原安全地址和密钥上传，读取 upload_id。最终回复提交 media:[{upload_id:"返回的ID"}]，每项只传 upload_id；不要提交本地路径、原始 URL 或跨任务引用让桥接读取。
+>
+> 不使用客户端时，只能向固定 QQ_REPLY_URL 同源的 /jobs/<本次job_id>/uploads/<upload_id> PUT 原始二进制。upload_id 为 UTF-8 JSON.stringify([kind,name,文件SHA256]) 的 SHA256；带 X-Reply-Token、Content-Type:application/octet-stream、Content-Length、X-Media-Kind、encodeURIComponent(name) 编码的 X-Media-Name，以及小写十六进制 X-Content-SHA256。name 是原文件名，不是路径。超时先带鉴权 GET 同一地址核对，再保持同一文件与元数据重试。上传成功不代表已发 QQ，须检查最终回复的 files_sent/voices_sent；权限或格式失败时如实报告，不盲目重复发送。上传和最终回复都不得超过原 reply_deadline。
 >
 > memory.content / memory.etag 是会话记忆快照。需要更新时，仅访问同源且路径为 /jobs/<本次job_id>/memory 的 memory_url，带 X-Reply-Token GET 最新内容，再合并并 PUT {content:"完整的新Markdown"}，请求头 If-Match 为最新 etag。412 时重新读取、合并后更新，428 表示缺少 If-Match；不要直接覆盖他人的修改。记忆上限 64 KiB。需要保留的媒体和记忆操作在 reply_deadline 前完成。
 >
@@ -225,7 +235,7 @@ loginctl show-user "$(id -un)" -p Linger
 
 实际 QQ 消息由用户发送，必要时只请求一条清晰的测试指令；不能仅为验收向未经授权的群或用户发送消息。沙箱环境确认用户/群在允许名单中，且有对应私聊/群聊事件权限。
 
-核对任务状态、尝试次数、截止时间、`parts_sent`、`images_sent` 和完成计数，不展示私聊正文。自动化测试已覆盖恢复和防重，生产不必故意制造中断。云端执行慢时继续观察在途任务，不因 webhook 已返回 2xx 就再次触发。群聊 5 分钟、私聊 60 分钟的原始回复时限不会随排队延长。
+核对任务状态、尝试次数、截止时间、`parts_sent`、`images_sent`、`files_sent`、`voices_sent` 和完成计数，不展示私聊正文。文件/语音需在私聊、群聊分别验证权限、文件可下载、语音可播放及大文件入口限制，不能只凭 SDK 方法存在宣称账号已开通。自动化测试已覆盖恢复和防重，生产不必故意制造中断。云端执行慢时继续观察在途任务，不因 webhook 已返回 2xx 就再次触发。群聊 5 分钟、私聊 60 分钟的原始回复时限不会随排队延长。
 
 ## 8. Windows 前台测试分支
 

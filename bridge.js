@@ -15,6 +15,7 @@ const { JobStore, ForwardWorker } = require('./jobs');
 const { RemoteAccess } = require('./remote');
 const { acquireInstanceLock } = require('./instance_lock');
 const { GatewaySession } = require('./gateway_session');
+const { cleanupTemporaryUploads } = require('./outbound_store');
 const VERSION = require('./package.json').version;
 const APP_ID = process.env.QQ_APP_ID, SECRET = process.env.QQ_APP_SECRET;
 if (!APP_ID || !SECRET) { console.error('FATAL: env QQ_APP_ID and QQ_APP_SECRET are required (not set). Exiting.'); process.exit(78); }
@@ -26,6 +27,7 @@ const history = createHistory({ dir: process.env.QQ_HISTORY_DIR || path.join(__d
 const { readAll, historyLimit, append, mergeRecent } = history;
 const queueDir = path.resolve(process.env.QQ_JOBS_DIR || path.join(__dirname, 'data', 'jobs'));
 await acquireInstanceLock(queueDir);
+cleanupTemporaryUploads(queueDir);
 const checkpoint = cfg.replyPublicUrl ? new GatewaySession(queueDir, APP_ID) : null;
 let wsRef = null, lastAliveAt = Date.now(), lastTick = Date.now();   // lastAliveAt/lastTick are stamped on READY/RESUMED and on heartbeat ACKs
 let jobs = null;
@@ -267,4 +269,4 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   srv.close(async () => { await worker?.running; process.exit(0); });
 });
 }
-start().catch(e => { console.error('FATAL:', e.message); process.exit(['EINSTANCELOCKED', 'EJOBSTATE', 'EKNOWLEDGESTATE'].includes(e.code) ? 78 : 1); });
+start().catch(e => { console.error('FATAL:', e.message); process.exit(['EINSTANCELOCKED', 'EJOBSTATE', 'EKNOWLEDGESTATE', 'EOUTBOUNDSTATE'].includes(e.code) ? 78 : 1); });

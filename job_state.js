@@ -3,6 +3,7 @@ const fs = require('node:fs'), path = require('node:path'), crypto = require('no
 const { isDeepStrictEqual } = require('node:util');
 const { REPLY_LIMITS, messageLimit } = require('./policy');
 const { CODES } = require('./forwarding');
+const { validMedia, uploadId, MEDIA_LIMITS } = require('./outbound_format');
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const targetOf = p => p.type === 'group' ? p.group_openid : p.openid;
@@ -32,6 +33,14 @@ function validateJob(job, file) {
     && typeof value === 'string' && !!value), 'assets');
   if (job.lastError !== undefined) need(typeof job.lastError === 'string', 'lastError');
   if (job.sentCount !== undefined) need(count(job.sentCount) && job.sentCount <= messageLimit(p.type, p.msg_id), 'sentCount');
+  if (job.uploads !== undefined) {
+    need(object(job.uploads) && Object.keys(job.uploads).length <= MEDIA_LIMITS.count, 'uploads');
+    let bytes = 0;
+    for (const [id, item] of Object.entries(job.uploads)) {
+      need(validMedia(item) && uploadId(item) === id, 'uploads.item'); bytes += item.bytes;
+    }
+    need(bytes <= MEDIA_LIMITS.jobBytes, 'uploads.bytes');
+  }
   if (job.forward !== undefined) {
     const f = job.forward;
     need(object(f), 'forward');

@@ -3,6 +3,7 @@ const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { REPLY_LIMITS } = require('./policy');
 const { digest, targetOf, idOf, readJobs } = require('./job_state');
 const { transportOutcome, responseOutcome, interruptedForward } = require('./forwarding');
+const { removeJobUploads } = require('./outbound_store');
 const repliesOf = job => job.replies || (job.reply ? [job.reply] : []);
 const replyClosed = job => job.reply?.state === 'done' && (job.reply.final !== false || !job.reply.body?.ok);
 function atomicFile(file, contents) {
@@ -40,6 +41,7 @@ class JobStore {
   save(job) { atomicWrite(path.join(this.dir, job.id + '.json'), job); }
   prune() {
     for (const [id, job] of this.jobs) if (job.deadline + this.retentionMs < this.now()) {
+      removeJobUploads(this.dir, id);
       fs.unlinkSync(path.join(this.dir, id + '.json')); this.jobs.delete(id);
     }
   }
