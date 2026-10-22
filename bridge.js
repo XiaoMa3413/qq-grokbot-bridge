@@ -206,7 +206,7 @@ function acceptDispatch(m, isCurrent = () => true) {
   }
 }
 const dispatchQueue = [];
-let drainingDispatches = false, activeDispatch = null;
+let drainingDispatches = false, activeDispatch = null, dispatchesSinceYield = 0;
 async function drainDispatches() {
   if (drainingDispatches) return;
   drainingDispatches = true;
@@ -222,6 +222,12 @@ async function drainDispatches() {
       }
       catch (error) { if (current()) failIngress(message, socket, error); }
       finally { activeDispatch = null; }
+      // Background history/checkpoint writes are synchronous. Give sockets and
+      // timers an I/O turn during bursts, rather than starving HTTP and ACKs.
+      if (++dispatchesSinceYield >= 16) {
+        dispatchesSinceYield = 0;
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
   } finally { drainingDispatches = false; }
 }

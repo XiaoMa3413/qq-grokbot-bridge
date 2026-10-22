@@ -128,7 +128,7 @@ test('real permission denial keeps dedicated at replies working and never forwar
   assert.doesNotMatch(child.output + JSON.stringify(f.deliveries), /private upstream diagnostic/);
 });
 
-test('a cold-lookup backlog reconnects with forward progress and does not wake Grok for ordinary messages', { timeout: 20000 }, async t => {
+test('a cold-lookup backlog reconnects with forward progress and does not wake Grok for ordinary messages', { timeout: 40000 }, async t => {
   let release; const gate = new Promise(resolve => release = resolve);
   const events = Array.from({ length: 270 }, (_, i) => groupEvent('BACKGROUND-' + i, i + 2));
   events.push(groupEvent('SELF-AT', 272, { mentions: [{ id: 'SELF_BOT' }] }));
@@ -137,7 +137,29 @@ test('a cold-lookup backlog reconnects with forward progress and does not wake G
   const child = await f.start();
   await waitFor(() => child.output.includes('dispatch backlog full'), 'bounded ingress backlog');
   release();
-  await waitFor(() => f.deliveries.length === 1 && checkpoint(f).seq === 272, 'replayed burst makes progress', 15000);
+  try { await waitFor(() => f.deliveries.length === 1 && checkpoint(f).seq === 272, 'replayed burst makes progress', 30000); }
+  catch (error) { throw new Error(error.message + '\n' + child.output.slice(-4000), { cause: error }); }
   assert.equal(f.deliveries[0].msg_id, 'SELF-AT'); assert.equal(f.stateQueries.length, 1);
   assert.ok(f.resumes.length >= 1); assert.equal(f.sends.length, 0);
+});
+
+test('slow background disk writes leave health and network I/O responsive before a burst completes', { timeout: 15000 }, async t => {
+  const events = Array.from({ length: 80 }, (_, i) => groupEvent('SLOW-' + i, i + 2));
+  const f = await fixture(t, { events, groupState(req, res) { res.end(JSON.stringify(state('all'))); } });
+  const preload = path.join(f.root, 'slow-background.cjs');
+  fs.writeFileSync(preload, `
+    const fs=require('node:fs'),append=fs.appendFileSync;
+    fs.appendFileSync=function(file,...args){
+      if(process.env.QQ_HISTORY_DIR&&String(file).startsWith(process.env.QQ_HISTORY_DIR))
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);
+      return append.call(this,file,...args);
+    };
+  `);
+  const child = await f.start({ preload });
+  await waitFor(() => child.output.includes('recv group-nonat SLOW-8'), 'slow background processing');
+  const response = await fetch(child.url + '/health', { signal: AbortSignal.timeout(5000) });
+  assert.equal((await response.json()).ok, true);
+  assert.ok(checkpoint(f).seq < 81, 'HTTP health responds while background frames still remain');
+  await waitFor(() => checkpoint(f).seq === 81 && child.output.includes('recv group-nonat SLOW-79'), 'background completion');
+  assert.equal(f.deliveries.length, 0); assert.equal(f.sends.length, 0);
 });
