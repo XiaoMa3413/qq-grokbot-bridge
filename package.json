@@ -10,6 +10,7 @@
     "test": "test"
   },
   "scripts": {
+    "test:client": "node --test test/client.test.js",
     "setup": "node scripts/setup.js",
     "doctor": "node scripts/doctor.js",
     "start": "node --env-file-if-exists=.env bridge.js",

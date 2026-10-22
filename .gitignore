@@ -11,3 +11,6 @@ data/
 memory/*
 !memory/.gitkeep
 /HANDOFF.local.md
+/client/.state/
+/client/private/
+__pycache__/

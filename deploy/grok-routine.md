@@ -1,5 +1,7 @@
 # Grok webhook 任务配置
 
+需要减少每次拼装回复 JSON 和附件的操作时，可独立安装 [Python 轻量客户端](../client/README.md)，并在原例行任务中引用 [调用说明](../client/AGENT_GUIDE.md)。它只要求 Python 3.10+，无需在 Grok 云电脑上升级服务端 Node 仓库或运行常驻进程；使用显式固定地址与现有密钥文件。客户端发生结果不明时不能换成下文的裸 HTTP 路径强制重发。
+
 桥接在常驻服务器上维护 QQ 连接；Grok 通过已有官方 webhook 例行任务处理输入，并调用远程回复接口。原有文字回传保持兼容，分段、图片、记忆及防重规则见 [远程协议](remote-protocol.md)。
 
 首次部署可直接把 [agent 部署任务](../DEPLOY_AGENT.md) 交给有目标主机访问权的 agent，其中包含完整安装流程和可复制的任务规则。本页用于单独调整 Grok 配置。
