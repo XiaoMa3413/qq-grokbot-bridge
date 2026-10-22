@@ -1,6 +1,6 @@
 # Grok 云电脑轻量客户端
 
-客户端版本 **1.0.0**，使用 Python **3.10+ 标准库**，不需要 Node、npm、第三方包或常驻进程。服务端保持原有部署；完整功能要求桥接 **1.8+**。客户端与服务端版本独立。
+客户端版本 **1.1.0**，使用 Python **3.10+ 标准库**，不需要 Node、npm、第三方包或常驻进程。服务端保持原有部署；完整功能要求桥接 **1.8+**。客户端与服务端版本独立。
 
 它封装任务查询、进度、最终回复、图片编码及文件/语音上传，让执行方无需每次编写路由 JSON。不会缩短平台唤醒或模型生成耗时，不提供 TTS。
 
@@ -33,13 +33,16 @@ python qq_bridge.py --config private/client.json doctor --live
 将例行任务提供的原始 webhook JSON 保存为私有 `task.json`，不要根据正文重建路由。该文件保留 `job_id/type/openid或group_openid/msg_id/reply_deadline/reply_policy`；完整历史可以继续由 Grok 从本次输入读取，客户端不会重新下载。
 
 ```bash
+python qq_bridge.py --config private/client.json --task private/task.json begin
 python qq_bridge.py --config private/client.json --task private/task.json status
 python qq_bridge.py --config private/client.json --task private/task.json progress --text '好的，我这就去查。'
 # 实际完成工作后，将答案写入 UTF-8 文件：
 python qq_bridge.py --config private/client.json --task private/task.json final --text-file private/answer.txt
 ```
 
-简单任务直接 `final`，无需先发进度。默认操作 ID 分别为 `progress`、`final`。确实需要另一条进度时显式使用稳定的 `--operation progress-2`，不要在错误后不断换 ID。
+保存原任务后立即调用 `begin`，仅记录本地客户端入口，不联网、不发 QQ、不占消息配额。可将保存任务和 `begin` 放在同一次终端工具调用内，减少模型往返；不要先搜索或整理长答案再补标记。这个时刻不等于平台真正开始执行的时刻，也不会延长原任务期限。
+
+简单任务直接 `final`，无需先发进度；耗时任务在开始检索前先 `progress`。上面的 `status` 是独立诊断示例，`progress/final` 已自带检查，正常执行无需重复查询。默认操作 ID 分别为 `progress`、`final`。确实需要另一条进度时显式使用稳定的 `--operation progress-2`，不要在错误后不断换 ID。
 
 附件与最终回复一起交付：
 
@@ -78,11 +81,31 @@ stdout 为一行 JSON，退出码 `0` 表示本次操作成功，非零需要检
 
 - `duration_ms`：本次客户端调用的总耗时，包含本地处理。
 - `started_at`：本次调用开始的 UTC 时间，可与其他阶段记录对应。
+- `completed_at`：本次操作得到结果时的 UTC 时间；最终计时文件写入和 stdout 输出收尾不计入 `duration_ms`。
 - `timings[]`：`status/upload_status/upload/reply/health` 每次 HTTP 请求的状态及耗时。上传与 QQ 最终发送分开记录。
 - `replayed`：服务端命中了已有段；`local_replayed`：客户端命中本地已确认成功结果。
 - 只有 HTTP 2xx 且 `ok:true`、计数完整才确认发送。不能把 `doctor`、上传或工具安装成功当作真实 QQ 收发成功。
 
-这些数据测不到 webhook 到平台开始执行的排队/唤醒时间，也不包含 Grok 调用工具之前的阅读和思考。前后对比时分别记录用户发消息、Grok 开始执行、首段到达、最终结果到达，使用相近任务、多次观察，不承诺固定提速比例。诊断输出可能反映任务状态，勿直接公开生产日志。
+### 自动保存与离线读取
+
+1.1 起，任务、路由和配置有效后，客户端会自动在同一状态目录的 `<job_id>/telemetry/` 保存独立的计时 JSON：开始时落盘，HTTP 前后更新，结束时记录结果。即使 stdout 没有重定向，也可事后读取。普通安装时不带任务的 `doctor` 不生成任务记录。发送 outbox 的原字段、指纹和防重逻辑不因计时记录改变，1.0 的状态可以直接保留使用。
+
+```bash
+python qq_bridge.py --config private/client.json --task private/task.json timings
+# 可选 --limit 1..128，默认显示最近20条；命令本身不联网、不发送也不补写历史。
+```
+
+输出中 `entries` 才是保存的历史；顶层 `started_at/duration_ms` 只表示当前读取命令，不能冒充原任务耗时。`first_recorded_client_started_at` 是最早留存调用，`begin_started_at` 是最早留存的 `begin`，两者都不证明平台开工时间。`platform_start_known` 始终为 `false`；平台启动/排队/唤醒仍需平台侧独立记录。
+
+- `state:running` 只表示没有完成收尾记录，可能仍在执行或已中断；`active_request` 只记录准备/等待哪类请求，不能证明消息未发送。发送结果仍以服务端和 outbox 为准。
+- 失败调用和本地缓存重放也会记录，后者保留 `local_replayed:true`，不会作为新发 QQ 的样本。
+- `telemetry_saved:false` 表示计时未成功保存；不会改变已经确定的回复成功结果或自动补发。应检查本地存储，不要为修复计时而重发消息。
+- 每任务最多128条记录、单条最多64KiB；达到上限停止新记录，不清除旧记录、不阻止正常回传。目录仅当前用户可访问，文件权限600；Windows使用受限目录ACL。与任务/outbox一起按原数据保留策略管理。
+- 记录只含版本、命令类别、时刻、HTTP类别/状态、耗时和安全结果计数，不保存参数、正文、收件人、URL、密钥或原始错误。离线导出跳过损坏记录，并报告 `invalid_records`，不输出损坏内容。记录中的作用域绑定哈希用于校验，不输出到导出报告。
+
+1.0 只在 stdout 打印的计时无法由旧 outbox 或文件修改时间恢复。没有记录时如实返回空列表，不根据 webhook 接受时间、完成摘要或 mtime 伪造起点；也不要对已经完成的旧任务新跑 `begin` 来补造历史。正常升级后自然收到的下一条任务才会留下新证据。
+
+这些数据测不到 webhook 到平台开始执行的排队/唤醒时间，也不包含 Grok 调用工具之前的阅读和思考。跨主机时钟偏差也会影响时间差；调用和HTTP时长使用单调时钟，不能仅凭跨主机时间戳精确归因。前后对比时分别记录用户发消息、Grok 开始执行、首段到达、最终结果到达，使用相近任务、多次观察，不承诺固定提速比例。诊断输出可能反映任务状态，勿直接公开生产日志。
 
 客户端不更改会话记忆与导入资料协议。Grok 继续按现有规则处理这两层数据；本版只封装高频回复与附件路径。技能调用说明见 [AGENT_GUIDE.md](AGENT_GUIDE.md)。
 
