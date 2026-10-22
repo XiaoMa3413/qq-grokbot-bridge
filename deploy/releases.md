@@ -3,7 +3,7 @@
 - `v1.1.0`：已验证的远程文字收发及休眠唤醒基线。
 - `v1.2.0`：持久化转发、回调防重、远程图片与会话记忆接口。
 - 新变更从最新 `main` 创建独立分支，分次提交后通过 PR 合并；使用带说明的 Git 标签标记功能版本，已发布标签不重写。纯文档更新不修改运行版本。
-- `deploy/ci-test.yml` 提供 Node.js 22/24、Windows/Linux 的测试模板，尚未启用 Actions。需要启用时，将模板放到 `.github/workflows/test.yml` 并使用具有相应权限的账户提交。
+- `.github/workflows/test.yml` 在 PR 和 main 更新时执行 Node.js 22/24、Windows/Linux 四组自动测试，也支持手动触发。合并前确认四组均通过；流水线不需要部署凭据，也不部署服务。
 - `.env*`（除示例）、`reply_token`、`data/`、`memory/`、日志不进入版本库。发布前检查暂存区是否含运行密钥。
 
 ## 升级

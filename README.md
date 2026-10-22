@@ -190,7 +190,7 @@ QQ 机器人需具备相应私聊/群聊事件权限。沙箱机器人还需把�
 
 `npm test` 覆盖事件解析、历史、鉴权、图片、记忆并发、任务恢复、防重及模拟服务集成。首次部署还需通过 QQ 发送实际消息，确认 Grok 任务执行并成功回传；完整验收步骤见 [部署指南](DEPLOY_AGENT.md#7-按阶段验收)。
 
-[CI 模板](deploy/ci-test.yml) 提供 Node.js 22/24、Windows/Linux 矩阵，**当前尚未启用 GitHub Actions**。功能版本使用 Git 标签固定，升级前备份并等待在途任务完成，不直接覆盖运行目录中的配置或数据。
+[自动测试](.github/workflows/test.yml) 在 PR 和 main 更新时运行 Node.js 22/24、Windows/Linux 四组检查，也可在 GitHub Actions 页面手动触发。每组执行 `npm ci` 和 `npm test`，无需配置 QQ 或 Grok 凭据。功能版本使用 Git 标签固定，升级前备份并等待在途任务完成，不直接覆盖运行目录中的配置或数据。
 
 | 文档 | 内容 |
 |---|---|
