@@ -46,6 +46,8 @@ function parseContextElement(el) {
     }
   }
   if (cur) entries.push(cur);
+  // The envelope author/ID identifies the context element, not a proven author
+  // of any text block inside it. Do not inherit it, even for a single block.
   // Element-level attachments are a fallback for a single-message element whose
   // image came through as a real attachment object rather than a "[图片]" line.
   if (Array.isArray(el.attachments) && el.attachments.length && entries.length) {
@@ -107,6 +109,7 @@ function parseElements(d) {
         if (typeof el.msg_id === 'string' && el.msg_id && !el.msg_id.startsWith('TMP_')) quote.msg_id = el.msg_id;
         const openid = el.author?.member_openid || el.author?.user_openid;
         if (typeof openid === 'string' && openid) quote.openid = openid;
+        if (typeof el.author?.bot === 'boolean') quote.author_bot = el.author.bot;
         quoted.push(quote);
       }
 
@@ -163,7 +166,9 @@ class RecentImages {
     if (!entry || typeof entry !== 'object') return;
     const list = this._groups.get(group) || [];
     const ts = typeof entry.timestamp === 'number' ? entry.timestamp : now;
-    list.push({ local_path: entry.local_path, nickname: entry.nickname, timestamp: ts });
+    list.push({ local_path: entry.local_path, nickname: entry.nickname, timestamp: ts,
+      ...(typeof entry.openid === 'string' && entry.openid ? { openid: entry.openid } : {}),
+      ...(typeof entry.author_bot === 'boolean' ? { author_bot: entry.author_bot } : {}) });
     list.sort((a, b) => a.timestamp - b.timestamp);
     const floor = now - this.windowMs;
     this._groups.set(group, list.filter((e) => e.timestamp >= floor));
