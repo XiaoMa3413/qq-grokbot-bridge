@@ -1,6 +1,6 @@
 # Grok 云电脑轻量客户端
 
-客户端版本 **1.1.0**，使用 Python **3.10+ 标准库**，不需要 Node、npm、第三方包或常驻进程。服务端保持原有部署；完整功能要求桥接 **1.8+**。客户端与服务端版本独立。
+客户端版本 **1.2.0**，使用 Python **3.10+ 标准库**，不需要 Node、npm、第三方包或常驻进程。原回复功能要求桥接 **1.8+**，完整任务下载要求桥接 **1.11+**。客户端与服务端版本独立。
 
 它封装任务查询、进度、最终回复、图片编码及文件/语音上传，让执行方无需每次编写路由 JSON。不会缩短平台唤醒或模型生成耗时，不提供 TTS。
 
@@ -30,19 +30,26 @@ python qq_bridge.py --config private/client.json doctor --live
 
 ## 执行一次真实任务
 
-将例行任务提供的原始 webhook JSON 保存为私有 `task.json`，不要根据正文重建路由。该文件保留 `job_id/type/openid或group_openid/msg_id/reply_deadline/reply_policy`；完整历史可以继续由 Grok 从本次输入读取，客户端不会重新下载。
+将例行任务提供的原始 webhook JSON 保存为私有 `received.json`，不要根据正文重建路由或裁剪数组。该文件至少须保留 `job_id/type/openid或group_openid/msg_id`。桥接 1.11+ 使用如下流程，避免收到或转存的文件缺少上下文：
 
 ```bash
-python qq_bridge.py --config private/client.json --task private/task.json begin
-python qq_bridge.py --config private/client.json --task private/task.json status
-python qq_bridge.py --config private/client.json --task private/task.json progress --text '好的，我这就去查。'
+python qq_bridge.py --config private/client.json --task private/received.json begin
+python qq_bridge.py --config private/client.json --task private/received.json fetch-task
+# 必须检查成功结果并读取 task_file 全文；后续所有命令使用返回路径。
+python qq_bridge.py --config private/client.json --task <返回的task_file> progress --text '好的，我这就去查。'
 # 实际完成工作后，将答案写入 UTF-8 文件：
-python qq_bridge.py --config private/client.json --task private/task.json final --text-file private/answer.txt
+python qq_bridge.py --config private/client.json --task <返回的task_file> final --text-file private/answer.txt
 ```
 
 保存原任务后立即调用 `begin`，仅记录本地客户端入口，不联网、不发 QQ、不占消息配额。可将保存任务和 `begin` 放在同一次终端工具调用内，减少模型往返；不要先搜索或整理长答案再补标记。这个时刻不等于平台真正开始执行的时刻，也不会延长原任务期限。
 
-简单任务直接 `final`，无需先发进度；耗时任务在开始检索前先 `progress`。上面的 `status` 是独立诊断示例，`progress/final` 已自带检查，正常执行无需重复查询。默认操作 ID 分别为 `progress`、`final`。确实需要另一条进度时显式使用稳定的 `--operation progress-2`，不要在错误后不断换 ID。
+`fetch-task` 只向已配置回复地址同源的 `/jobs/<job_id>/payload` 发送一次带鉴权 GET，不采信输入里的 URL，不跟随重定向。服务器返回该任务已持久化的出站快照，包含原历史、引用、附件能力和记忆快照；不会按当前会话重新组装或触发 Grok。客户端校验 SHA-256、job 与路由、声明的历史条数，在私有状态目录的 `<job_id>/task/` 保存原字节及校验凭据，保留 `received.json`。后续发送会验证保存件及凭据，修改正文、缺失校验或使用未下载文件会被拒绝。
+
+输出 `task_file`、两份数组条数和 `received_matches_snapshot`，不输出正文或身份 ID。不同只说明文件不同，不能据此确定是平台截断还是转存遗漏。下载失败、过期、快照未准备好、校验失败或已存快照冲突时不覆盖已有文件，不自动重试或降级。接口沿用共享回复密钥和任务截止时间；不是平台原始入站审计，也不能恢复已过期任务。响应最多16MiB，任务原文最多8MiB。下载件同样属于私有任务数据，勿作附件发送。
+
+桥接 1.8–1.10 保持原回复流程，不支持 `fetch-task`。新版客户端不强迫旧任务下载；桥接 1.11+ 通过 `reply_policy.task_fetch` 声明能力，状态接口的 `task_fetch_required` 用于发送前检查，不能删字段来绕过。旧客户端仍兼容原回传，但没有此完整性保护，应更新客户端及例行任务后再验收。
+
+简单任务直接 `final`，无需先发进度；耗时任务在开始检索前先 `progress`。`progress/final` 已自带状态检查，正常执行无需重复查询。后文 `private/task.json` 均指已验证的 `task_file`，旧服务器则指原完整输入。默认操作 ID 分别为 `progress`、`final`。确实需要另一条进度时显式使用稳定的 `--operation progress-2`，不要在错误后不断换 ID。
 
 附件与最终回复一起交付：
 
@@ -77,12 +84,12 @@ python qq_bridge.py --config private/client.json --task private/task.json resume
 
 ## 耗时与验收
 
-stdout 为一行 JSON，退出码 `0` 表示本次操作成功，非零需要检查。结果只输出发送计数、安全状态及计时，不输出收件人、正文、凭据、原始异常或代理页面。
+stdout 为一行 JSON，退出码 `0` 表示本次操作成功，非零需要检查。结果输出发送计数、安全状态及计时；`fetch-task` 另返回私有保存路径和上下文条数。不输出收件人、正文、凭据、原始异常或代理页面。
 
 - `duration_ms`：本次客户端调用的总耗时，包含本地处理。
 - `started_at`：本次调用开始的 UTC 时间，可与其他阶段记录对应。
 - `completed_at`：本次操作得到结果时的 UTC 时间；最终计时文件写入和 stdout 输出收尾不计入 `duration_ms`。
-- `timings[]`：`status/upload_status/upload/reply/health` 每次 HTTP 请求的状态及耗时。上传与 QQ 最终发送分开记录。
+- `timings[]`：`task_fetch/status/upload_status/upload/reply/health` 每次 HTTP 请求的状态及耗时。任务下载、上传与 QQ 最终发送分开记录。
 - `replayed`：服务端命中了已有段；`local_replayed`：客户端命中本地已确认成功结果。
 - 只有 HTTP 2xx 且 `ok:true`、计数完整才确认发送。不能把 `doctor`、上传或工具安装成功当作真实 QQ 收发成功。
 

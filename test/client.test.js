@@ -2,6 +2,7 @@
 const { test } = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), http = require('node:http');
 const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const { JobStore } = require('../jobs');
 const { RemoteAccess } = require('../remote');
 const { createReplyServer, splitContent } = require('../reply_server');
@@ -27,6 +28,9 @@ async function fixture(t, type = 'c2c') {
   const app = http.createServer((req, res) => {
     requests.push({ method: req.method, path: req.url, token: req.headers['x-reply-token'] });
     if (controls.redirect) { res.writeHead(302, { Location: controls.redirect }); res.end('private proxy ' + TOKEN); return; }
+    if (controls.snapshot && req.url.endsWith('/payload')) {
+      res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(controls.snapshot)); return;
+    }
     if ((controls.dropReply && req.url === '/reply') || (controls.dropUpload && req.method === 'PUT')) {
       controls.dropReply = controls.dropUpload = false; res.end = () => { req.socket.destroy(); };
     }
@@ -42,8 +46,8 @@ async function fixture(t, type = 'c2c') {
       inline_max_bytes: MEDIA_LIMITS.inlineBytes, file_max_bytes: MEDIA_LIMITS.fileBytes, voice_max_bytes: MEDIA_LIMITS.voiceBytes,
       max_items: 5, job_upload_max_bytes: MEDIA_LIMITS.jobBytes } } };
   fs.writeFileSync(task, JSON.stringify(payload), { mode: 0o600 });
-  function start(args, extra = {}) {
-    const child = spawn(process.env.PYTHON || 'python', [CLIENT, '--config', config, '--task', task, '--state-dir', state, ...args], {
+  function start(args, extra = {}, taskFile = task) {
+    const child = spawn(process.env.PYTHON || 'python', [CLIENT, '--config', config, '--task', taskFile, '--state-dir', state, ...args], {
       cwd: root, env: { ...cleanEnv(), ...extra }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', c => stdout += c); child.stderr.on('data', c => stderr += c);
@@ -55,7 +59,7 @@ async function fixture(t, type = 'c2c') {
     });
     return { child, done };
   }
-  const cli = async (args, extra) => start(args, extra).done;
+  const cli = async (args, extra, taskFile) => start(args, extra, taskFile).done;
   t.after(async () => {
     if (controls.release) controls.release();
     app.closeAllConnections(); await new Promise(resolve => app.close(resolve));
@@ -65,10 +69,110 @@ async function fixture(t, type = 'c2c') {
   return { root, calls, requests, controls, store, job, payload, state, config, task, cli, start, history, api };
 }
 
+function preparedSnapshot(f, changes = {}) {
+  f.job.payload = structuredClone({ ...f.payload, history: [], quoted: [], recent_context: [], recent_images: [],
+    ...changes, reply_policy: { ...f.payload.reply_policy, task_fetch: true } });
+  f.job.prepared = true; f.store.save(f.job);
+  return f.job.payload;
+}
+function snapshotResponse(f, task = f.job.payload) {
+  const payload_json = JSON.stringify(task);
+  return { ok: true, job_id: f.job.id, payload_json, sha256: createHash('sha256').update(payload_json).digest('hex') };
+}
+
+test('fetch-task repairs missing group history through the fixed origin and preserves the received evidence', async t => {
+  const f = await fixture(t, 'group');
+  const history = Array.from({ length: 10 }, (_, i) => ({ content: i === 9 ? 'new member: 测试😀' : 'prior-' + i,
+    openid: i === 9 ? 'ANOTHER_MEMBER' : 'CURRENT_MEMBER', attribution: { speaker: 'other' } }));
+  const snapshot = preparedSnapshot(f, { history, context: { history: { sent_entries: 10 } } });
+  fs.writeFileSync(f.task, JSON.stringify({ ...snapshot, history: history.slice(0, 7) }));
+  const received = fs.readFileSync(f.task);
+  assert.equal((await f.cli(['final', '--text', 'premature'])).value.error, 'verified_task_required');
+  const result = await f.cli(['fetch-task']);
+  assert.equal(result.code, 0, result.stdout); assert.equal(result.value.verified, true);
+  assert.equal(result.value.context_counts.history, 10); assert.equal(result.value.received_context_counts.history, 7);
+  assert.equal(result.value.received_matches_snapshot, false);
+  assert.deepEqual(fs.readFileSync(f.task), received);
+  const canonical = result.value.task_file;
+  assert.equal(fs.readFileSync(canonical, 'utf8'), JSON.stringify(snapshot));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(canonical).mode & 0o777, 0o600);
+  assert.equal(f.requests.at(-1).path, '/jobs/' + f.job.id + '/payload');
+  assert.equal(f.requests.at(-1).token, TOKEN); assert.equal(f.job.sentCount, undefined);
+  assert.equal(f.calls.length, 0); assert.ok(!result.stdout.includes(TOKEN)); assert.ok(!result.stdout.includes('ANOTHER_MEMBER'));
+  const again = await f.cli(['fetch-task'], {}, canonical);
+  assert.equal(again.value.received_matches_snapshot, true);
+  assert.equal((await f.cli(['final', '--text', 'based on complete history'], {}, canonical)).code, 0);
+  assert.equal(f.calls.length, 1);
+  assert.equal((await f.cli(['timings'], {}, canonical)).value.entries.some(x => x.command === 'fetch-task'), true);
+});
+
+test('fetch-task validates hashes, routes and counts before writing and preserves a conflicting saved snapshot', async t => {
+  const f = await fixture(t); preparedSnapshot(f);
+  f.controls.snapshot = { ...snapshotResponse(f), payload_json: JSON.stringify({ ...f.job.payload, history: [1] }) };
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_snapshot_integrity_failed');
+  const canonical = path.join(f.state, f.job.id, 'task/payload.json');
+  assert.equal(fs.existsSync(canonical), false);
+  f.controls.snapshot = snapshotResponse(f, { ...f.job.payload, openid: 'FOREIGN' });
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_snapshot_route_mismatch');
+  f.controls.snapshot = snapshotResponse(f, { ...f.job.payload, context: { history: { sent_entries: 10 } } });
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_snapshot_context_mismatch');
+  f.controls.snapshot = snapshotResponse(f);
+  assert.equal((await f.cli(['fetch-task'])).code, 0);
+  const saved = fs.readFileSync(canonical);
+  f.controls.snapshot = snapshotResponse(f, { ...f.job.payload, content: 'changed remotely' });
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_snapshot_changed');
+  assert.deepEqual(fs.readFileSync(canonical), saved);
+  fs.writeFileSync(canonical, JSON.stringify({ ...f.job.payload, history: [{ content: 'edited locally' }] }));
+  assert.equal((await f.cli(['final', '--text', 'must not send'], {}, canonical)).value.error, 'task_snapshot_integrity_failed');
+  assert.equal(f.calls.length, 0);
+});
+
+test('task snapshot access enforces authentication, preparation and expiry without changing delivery', async t => {
+  const f = await fixture(t), original = fs.readFileSync(f.task);
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_fetch_rejected');
+  preparedSnapshot(f);
+  assert.equal((await f.cli(['fetch-task'], { QQ_REPLY_TOKEN: 'invalid-but-long-enough-token-0123456789' })).value.error, 'task_fetch_rejected');
+  f.job.payload.memory = { content: 'x'.repeat(8 * 1024 * 1024) };
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_fetch_rejected');
+  delete f.job.payload.memory;
+  f.job.deadline = Date.now() - 1;
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'task_fetch_rejected');
+  assert.equal(f.job.delivery, 'pending'); assert.equal(f.calls.length, 0);
+  assert.deepEqual(fs.readFileSync(f.task), original);
+});
+
+test('a malformed snapshot creates no saved task and a read-only retry does not send QQ', async t => {
+  const f = await fixture(t); preparedSnapshot(f);
+  f.controls.snapshot = { ok: true, job_id: f.job.id, payload_json: '{', sha256: createHash('sha256').update('{').digest('hex') };
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'invalid_input_or_local_io');
+  const canonical = path.join(f.state, f.job.id, 'task/payload.json');
+  assert.equal(fs.existsSync(canonical), false);
+  delete f.controls.snapshot;
+  assert.equal((await f.cli(['fetch-task'])).code, 0);
+  assert.equal(f.calls.length, 0); assert.equal(f.job.delivery, 'pending');
+});
+
+test('task fetching handles large unicode snapshots and refuses redirects or linked destinations', async t => {
+  const f = await fixture(t); preparedSnapshot(f, { memory: { content: '多字节😀'.repeat(90000) } });
+  f.controls.redirect = 'https://attacker.example/payload';
+  assert.equal((await f.cli(['fetch-task'])).value.error, 'invalid_json_response');
+  delete f.controls.redirect;
+  const fetched = await f.cli(['fetch-task']); assert.equal(fetched.code, 0, fetched.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(fetched.value.task_file)), f.job.payload);
+  const canonical = fetched.value.task_file;
+  fs.unlinkSync(canonical);
+  // File symlinks are available on POSIX; Windows permissions vary by runner.
+  if (process.platform !== 'win32') {
+    fs.symlinkSync(f.task, canonical);
+    assert.equal((await f.cli(['fetch-task'])).value.error, 'linked_state_file');
+  }
+  assert.equal(f.calls.length, 0);
+});
+
 test('standalone client reads an explicit URL and existing token file, probes without token and reports timings', async t => {
   const f = await fixture(t);
   const result = await f.cli(['doctor', '--live']);
-  assert.equal(result.code, 0); assert.equal(result.value.client_version, '1.1.0');
+  assert.equal(result.code, 0); assert.equal(result.value.client_version, '1.2.0');
   assert.equal(result.value.bridge_version, '1.8.0'); assert.equal(result.value.reply_token_available, true);
   assert.equal(f.requests[0].path, '/health'); assert.equal(f.requests[0].token, undefined);
   assert.equal(result.value.timings[0].http_status, 200); assert.ok(result.value.timings[0].duration_ms >= 0);
